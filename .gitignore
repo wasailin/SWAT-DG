@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+wheels/
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+*.so
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# SWAT runtime outputs
+*.exe
+output.*
+fin.fin
+backup_*/
+*.o
+*.mod
+*.obj
+fortran/build/
+
+# Distribution
+packaging/build/
+packaging/SWAT-DG-*/
+packaging/*.zip
+dist/
