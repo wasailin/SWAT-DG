@@ -1,0 +1,110 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swat-dg"
+version = "0.5.0"
+description = "Python wrapper and automation tools for SWAT2012 hydrological model"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "SWAT-DG Team"}
+]
+keywords = ["swat", "hydrology", "watershed", "modeling", "calibration"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Hydrology",
+]
+
+dependencies = [
+    "numpy>=1.20",
+    "pandas>=1.3",
+    "matplotlib>=3.4",
+]
+
+[project.optional-dependencies]
+calibration = [
+    "spotpy>=1.5",
+    "pathos>=0.3",
+]
+gis = [
+    "geopandas>=0.10",
+    "rasterio>=1.2",
+    "pyproj>=3.0",
+    "xarray>=0.19",
+    "folium>=0.14",
+]
+data = [
+    "requests>=2.25",
+    "openpyxl>=3.0",
+]
+app = [
+    "streamlit>=1.28",
+    "plotly>=5.18",
+    "folium>=0.14",
+    "streamlit-folium>=0.15",
+]
+full = [
+    "spotpy>=1.5",
+    "pathos>=0.3",
+    "scipy>=1.7",
+    "shapely>=2.0",
+    "geopandas>=0.10",
+    "rasterio>=1.2",
+    "pyproj>=3.0",
+    "xarray>=0.19",
+    "folium>=0.14",
+    "requests>=2.25",
+    "openpyxl>=3.0",
+    "streamlit>=1.28",
+    "plotly>=5.18",
+    "streamlit-folium>=0.15",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=3.0",
+    "black>=22.0",
+    "ruff>=0.1.0",
+    "mypy>=0.990",
+]
+
+[project.urls]
+Homepage = "https://github.com/wasailin/SWAT-DG"
+Documentation = "https://swat-dg.readthedocs.io"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 88
+target-version = ['py310', 'py311', 'py312']
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = [
+    "slow: marks tests that run full SWAT simulations (deselect with '-m \"not slow\"')",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP"]
+ignore = ["E501"]  # Line too long (handled by black)
