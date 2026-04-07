@@ -1,79 +1,81 @@
-# SWAT-DG
+# SWAT-DG: Diagnostic-Guided SWAT Calibration
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-Python wrapper and automated calibration tools for the SWAT2012 hydrological model (Rev. 681 and above), with diagnostic-guided calibration.
-Developed by [Lynxce](https://www.lynxce-env.com/)
-Direct download from [Releases](https://github.com/wasailin/SWAT-DG/releases)
+Python framework for the SWAT2012 hydrological model (Rev. 681+) with **diagnostic-guided calibration** — physics-based parameter tuning that converges in minutes, not days.
+Developed by [Lynxce](https://www.lynxce-env.com/) | [Download Portable ZIP](https://github.com/wasailin/SWAT-DG/releases)
 
-## Features
+---
 
-### Core Functionality
-- **Run SWAT from Python** - Simple API to execute SWAT simulations
-- **Read/Write Input Files** - Parse and modify SWAT input parameters (.bsn, .sol, .mgt, .gw, .cio)
-- **Parse Outputs** - Convert SWAT outputs to pandas DataFrames (output.rch, output.sub, output.hru, output.std, output.rsv)
-- **Backup/Restore** - Safely backup and restore project files (selective backup for 99.9% size reduction)
-- **fig.fig Routing Parser** - Parse watershed routing, upstream/downstream traversal, partial-basin simulation via active subbasins
+## The Problem: Calibration is a Bottleneck
 
+SWAT has more than 45 adjustable parameters. Standard calibration tools try thousands of parameter combinations blindly — like tuning a complex instrument while blindfolded. The popular SCE-UA algorithm (used in SWAT-CUP) typically requires **5,000 to 50,000 model runs** to converge. At one minute per run, that's **3 to 35 days** of compute time.
 
-### Calibration (SPOTPY Integration)
-- **8+ Optimization Algorithms** - SCE-UA, DREAM, Monte Carlo, LHS, ROPE, DE-MCZ, and more
-- **45+ Calibration Parameters** - Pre-defined parameters with recommended bounds
-- **Parameter Boundary Manager** - Customize search bounds per parameter
-- **Objective Functions** - NSE, KGE, PBIAS, RMSE, MAE, R-squared, RSR, Log-NSE
-- **Sensitivity Analysis** - FAST and Sobol methods (parallel-capable)
-- **Multi-site Calibration** - Calibrate using multiple observation points simultaneously
-- **Sequential Multi-site Calibration** - Upstream-to-downstream step-by-step calibration
-- **Parallel Calibration** - Multi-core calibration via pathos
+Worse, blind optimization tells you *what* the best parameters are — but not *why* they work. When the model fails in a new scenario, you start over from scratch.
 
-### Diagnostic-Guided Calibration
-- **Diagnostic Calibration** - Physics-based parameter guidance from observed vs. simulated signatures (baseflow separation, peak analysis, volume balance, seasonal bias, FDC metrics)
-- **Ensemble Diagnostic Calibration** - Multiple diagnostic runs for robust parameter estimation with uncertainty
-- **Phased Calibration** - Sequential hydrology → sediment → nitrogen → phosphorus workflow
-- **Multi-constituent WQ Calibration** - Calibrate sediment, nitrogen, and phosphorus loads
-- **Load Calculator** - Convert SWAT output concentrations to constituent loads
-- **WQ Diagnostics** - Specialized diagnostic engines for sediment, nitrogen, and phosphorus
+## The Solution: Diagnose Before You Calibrate
 
-### Streamlit Web App (7 Pages)
-- **Project Setup** - Load SWAT project, auto-detect executable, display project info
-- **Watershed Map** - Interactive Folium map of subbasins and reaches with simulation output overlay
-- **Simulation Results** - View/export raw SWAT outputs, compare multiple simulations, filter by reach/subbasin
-- **Observation Data** - Import observed data (NWIS API, CSV, Excel), manage multiple sites
-- **Parameter Editor** - Edit parameters with live preview, batch editing, constraint validation, boundary editor
-- **Calibration** - Select mode (single-site, multi-site, sequential), choose algorithm and parameters, run calibration
-- **Results** - Performance metrics, hydrographs, scatter plots, export to JSON/CSV/HTML/PNG
-- **Session Persistence** - Full app state saving (survives browser refresh)
+SWAT-DG acts like an experienced hydrologist reading the hydrograph. Before touching any parameters, it runs **5 diagnostic checks** on simulated vs. observed streamflow:
 
-### Visualization Dashboard
-- **Hydrograph Plots** - Time series comparison of observed vs simulated (daily and monthly)
-- **Scatter Plots** - 1:1 plots with performance metrics, residual plots
-- **Flow Duration Curves** - Exceedance probability analysis
-- **Metrics Tables** - Formatted performance metrics with rating (Poor/Fair/Good/Excellent)
-- **Sensitivity Plots** - Parameter sensitivity tornado charts and ranking tables
-- **Diagnostic Plots** - Baseflow separation, peak comparison, seasonal bias, rating curves, flow partition
-- **Interactive Plotly Charts** - Interactive time series, multi-variable, bar summaries, scatter comparisons
-- **Export** - Save to PNG, PDF, or HTML reports
+1. **Volume balance** — Is total simulated water too high or too low?
+2. **Baseflow partition** — Is the groundwater/surface runoff split correct?
+3. **Peak events** — Are storm peaks the right magnitude and timing?
+4. **Flow duration curve** — Does the model reproduce wet, median, and dry flow statistics?
+5. **KGE decomposition** — Is poor performance from timing, variability, or bias?
 
-### Observation Data Import
-- **USGS NWIS** - Fetch streamflow and water quality data from USGS API
-- **Multi-format Loader** - CSV, Excel, TXT, TSV, USGS RDB format with auto-detection
-- **WQ Observation Loader** - Water Quality Portal (WQP/STORET), generic CSV with auto-detect; standardizes to elemental basis (as N, as P) with automatic compound-to-elemental unit conversion. Supports TN, TP, TSS, NO3, NH4, Organic N, Ortho-P, TKN, and Suspended Sediment Discharge
+These diagnostics feed **14 expert rules** that prescribe targeted parameter adjustments in 4 sequential phases. The result:
 
-### Data Automation Pipeline (US-Focused)
-- **Weather Data** - NOAA CDO API integration, auto-generate .pcp, .tmp, WGEN parameters
-- **Soil Data** - SSURGO integration, soil texture classification, .sol file generation
-- **Land Cover** - NLCD classification, SWAT code mapping, curve number lookup
-- **DEM Processing** - Sink filling, D8 flow direction, flow accumulation, watershed delineation
+| Method | Runs Needed | Time (1 min/run) |
+|--------|-------------|-------------------|
+| Monte Carlo | 1,000–10,000 | 17–167 hours |
+| SCE-UA (SWAT-CUP) | 5,000–50,000 | 83–833 hours |
+| **SWAT-DG Diagnostic** | **5–50** | **5–50 minutes** |
 
-### GIS / Spatial
-- **Watershed Map Builder** - Interactive Folium/Leaflet maps with subbasins and reaches
-- **Shapefile Loader** - Load GIS shapefiles, extract subbasin/reach topology
+> SWAT-DG is a rapid screening tool and smart warm-start. For publication-quality calibration, run SWAT-DG first to get a physically informed starting point, then refine with SCE-UA — cutting total iterations by 30–60%.
 
-### Portable Distribution
-- **SWAT-DG Portable** - Self-contained Windows ZIP with embedded Python; no installation needed
-- Download from [Releases](https://github.com/wasailin/SWAT-DG/releases)
+![Before vs After Calibration — metrics table and hydrograph comparison](docs/images/hero_before_after.png)
+
+---
+
+## Web Interface — No Code Required
+
+SWAT-DG includes a **7-page Streamlit web app** that runs 100% locally. All data stays on your computer. A portable Windows ZIP is available — no Python installation needed.
+
+<p align="center">
+  <img src="docs/images/calibration_diagnostics.png" width="32%" alt="Diagnostic findings and baseline hydrograph" />
+  <img src="docs/images/performance_metrics.png" width="32%" alt="Performance metrics dashboard" />
+  <img src="docs/images/spatial_map.png" width="32%" alt="Spatial summary with watershed map" />
+</p>
+
+**App pages:**
+- **Project Setup** — Load SWAT project, auto-detect executable, view project info
+- **Watershed Map** — Interactive Folium map of subbasins and reaches with simulation output overlay
+- **Simulation Results** — Browse raw SWAT outputs, compare runs, spatial summaries
+- **Observation Data** — Import from USGS NWIS API, CSV, Excel, WQP/STORET with auto unit conversion
+- **Parameter Editor** — Edit 45+ parameters with live bounds, batch editing, save/load presets
+- **Calibration** — Choose mode (single-site, multi-site, sequential, partial-basin), algorithm, and run
+- **Results** — Performance metrics, before/after hydrographs, scatter plots, FDC, diagnostic plots, export
+
+<p align="center">
+  <img src="docs/images/diagnostic_recommendations.png" width="48%" alt="Peak comparison with parameter recommendations" />
+  <img src="docs/images/flow_duration_curve.png" width="48%" alt="Flow Duration Curve — observed vs simulated" />
+</p>
+
+---
+
+## Key Features
+
+- **Diagnostic-Guided Calibration** — Single diagnostic, ensemble (parallel runs for uncertainty), phased (hydrology → sediment → nitrogen → phosphorus), multi-constituent water quality calibration with load calculator and WQ-specific diagnostic engines
+
+- **Traditional Calibration (SPOTPY)** — 8+ algorithms (SCE-UA, DREAM, Monte Carlo, LHS, ROPE, DE-MCZ), 45+ parameters with recommended bounds, 8 objective functions (NSE, KGE, PBIAS, RMSE, MAE, R², RSR, Log-NSE), sensitivity analysis (FAST, Sobol), multi-site and sequential calibration, parallel multi-core support
+
+- **Complete Python SWAT Wrapper** — Run simulations, read/write all input files (.bsn, .sol, .mgt, .gw, .cio), parse all outputs to DataFrames, backup/restore with 99.9% size reduction, fig.fig routing parser with upstream/downstream traversal, partial-basin active subbasin optimization
+
+- **Rich Visualization** — Hydrographs (daily/monthly), scatter plots, flow duration curves, diagnostic plots (baseflow separation, peak comparison, seasonal bias, rating curves), interactive Plotly charts, sensitivity tornado charts, export to PNG/PDF/HTML
+
+- **Data Automation** — USGS NWIS streamflow/WQ import, Water Quality Portal (WQP/STORET) with auto unit conversion, NOAA CDO weather data, SSURGO soil data, NLCD land cover, DEM processing and watershed delineation
 
 ## Installation
 
@@ -264,9 +266,16 @@ dashboard.to_html("calibration_report.html")
 - numpy, pandas, matplotlib
 - SWAT2012 executable, Rev. 681 or above (available from [Releases](https://github.com/wasailin/SWAT-DG/releases) or the [official SWAT website](https://swat.tamu.edu/))
 
-## Calibration Parameters
+## Documentation
 
-The package includes 45+ pre-defined calibration parameters organized by group:
+See the `docs/` folder:
+- [Quick Start](docs/quickstart.md)
+- [Installation](docs/installation.md)
+- [API Reference](docs/api_reference.md)
+- [User Manual](docs/user_manual.md)
+
+<details>
+<summary><strong>Calibration Parameters (45+)</strong></summary>
 
 | Group | Parameters |
 |-------|------------|
@@ -277,7 +286,10 @@ The package includes 45+ pre-defined calibration parameters organized by group:
 | Sediment | USLE_P, USLE_K, SPCON, SPEXP, CH_COV1, CH_COV2, PRF, ADJ_PKR |
 | Nutrients | NPERCO, PPERCO, CMN, PSP, N_UPDIS, PHOSKD, ERORGP, and more |
 
-## Calibration Algorithms
+</details>
+
+<details>
+<summary><strong>Calibration Algorithms</strong></summary>
 
 Via SPOTPY integration:
 
@@ -294,17 +306,10 @@ Diagnostic-guided (built-in):
 - **diagnostic_ensemble** - Multiple diagnostic runs with uncertainty
 - **phased** - Sequential hydrology → sediment → nitrogen → phosphorus
 
-## Documentation
+</details>
 
-See the `docs/` folder:
-- [Quick Start](docs/quickstart.md)
-- [Installation](docs/installation.md)
-- [API Reference](docs/api_reference.md)
-- [User Manual](docs/user_manual.md)
-
-## Project Status
-
-Current version: **v0.5.0**
+<details>
+<summary><strong>Project Status (v0.5.0)</strong></summary>
 
 ### Phase 1: Python Wrapper Foundation ✅
 - [x] Basic SWAT model wrapper (`SWATModel`)
@@ -354,6 +359,8 @@ Current version: **v0.5.0**
 - [x] Portable SWAT-DG Windows package (embedded Python 3.11, no install needed)
 - [x] Intel ifx compiler build (2.4x faster than gfortran)
 - [x] GIS integration (Folium maps, shapefile loading)
+
+</details>
 
 ## Contributing
 
