@@ -360,8 +360,45 @@ def _cleanup_working_dirs(state: CalibrationState):
             pass
 
 
+def _create_shared_cancel_file(state: CalibrationState):
+    """Create a single cross-process cancel file and register it on state.
+
+    The returned Path object is used by every setup / calibrator spawned
+    during this run so that ``state.request_cancel()`` immediately writes
+    the file and every worker process (which cannot share a
+    ``threading.Event``) sees the flag on its next ``simulation()`` check.
+
+    Returns
+    -------
+    pathlib.Path
+        The absolute path to the (not-yet-existing) cancel flag file.
+        Call :func:`_cleanup_shared_cancel_file` with its parent directory
+        when the run completes.
+    """
+    import tempfile
+    from pathlib import Path
+
+    cancel_dir = Path(tempfile.mkdtemp(prefix="swat_cancel_"))
+    cancel_file = cancel_dir / "cancel.flag"
+    state.register_cancel_file(str(cancel_file))
+    return cancel_file
+
+
+def _cleanup_shared_cancel_file(cancel_file):
+    """Remove the temp directory holding the cancel flag."""
+    if cancel_file is None:
+        return
+    try:
+        import shutil
+        from pathlib import Path
+        shutil.rmtree(str(Path(cancel_file).parent), ignore_errors=True)
+    except Exception:
+        pass
+
+
 def _run_calibration_background(state: CalibrationState, config: dict):
     """Thread target – runs full calibration pipeline."""
+    _shared_cancel_file = None
     try:
         # Suppress Streamlit warnings about missing ScriptRunContext
         # (this thread is not a Streamlit script thread)
@@ -375,6 +412,15 @@ def _run_calibration_background(state: CalibrationState, config: dict):
         from swat_modern import SWATModel
         from swat_modern.calibration import Calibrator
         from swat_modern.calibration.spotpy_setup import run_baseline_simulation
+
+        # Create a cross-process cancel file BEFORE any mode function runs.
+        # Every setup / calibrator spawned below receives this path; when
+        # the user clicks Cancel in the UI, ``state.request_cancel()``
+        # writes the file and parallel SPOTPY workers detect it on their
+        # next ``simulation()`` call.  See ``CalibrationState.register_cancel_file``.
+        _shared_cancel_file = _create_shared_cancel_file(state)
+        config = dict(config)  # don't mutate caller's dict
+        config["_cancel_file_path"] = str(_shared_cancel_file)
 
         state.step_message = "Loading SWAT model..."
         mode = config["mode"]
@@ -592,6 +638,21 @@ def _run_calibration_background(state: CalibrationState, config: dict):
                 f"{_bl_sp_start}--{_bl_sp_end} for baseline run"
             )
 
+        # Back up output files before baseline — model.run() deletes them,
+        # and if SWAT fails the user's original output would be lost.
+        import shutil as _shutil
+        _BL_OUTPUT_NAMES = (
+            "output.rch", "output.sub", "output.hru",
+            "output.rsv", "output.sed", "output.std",
+        )
+        _bl_output_backups = {}
+        for _fname in _BL_OUTPUT_NAMES:
+            _src = model.project_dir / _fname
+            if _src.exists():
+                _bak = _src.with_suffix(_src.suffix + ".bak_bl")
+                _shutil.copy2(_src, _bak)
+                _bl_output_backups[_fname] = _bak
+
         try:
             for bsite in baseline_sites:
                 _check_cancel(state)
@@ -605,20 +666,31 @@ def _run_calibration_background(state: CalibrationState, config: dict):
                     upstream_subbasins=bsite.get("upstream_subbasins"),
                     qswat_shapes_dir=_qswat_shapes,
                     cancel_event=state.cancel_event,
+                    print_code=config.get("calibration_print_code"),
                 )
                 bl["reach_id"] = bsite["reach_id"]
-                obs_df = bsite["observed"]
-                bl["observed"] = (
-                    obs_df["observed"].values
-                    if isinstance(obs_df, pd.DataFrame) and "observed" in obs_df.columns
-                    else None
-                )
+                # Use the merged observed values from run_baseline_simulation
+                # (aligned with bl["dates"] and bl["simulated"]).  Fall back
+                # to raw obs only if the baseline didn't produce them.
+                if bl.get("observed") is None:
+                    obs_df = bsite["observed"]
+                    bl["observed"] = (
+                        obs_df["observed"].values
+                        if isinstance(obs_df, pd.DataFrame) and "observed" in obs_df.columns
+                        else None
+                    )
                 baseline_results_all.append(bl)
         finally:
             if _bl_restored:
                 model.config.period.start_year = _bl_orig_start
                 model.config.period.end_year = _bl_orig_end
                 model.config.save()
+            # Restore original output files after baseline
+            for _fname, _bak in _bl_output_backups.items():
+                _dst = model.project_dir / _fname
+                if _bak.exists():
+                    _shutil.copy2(_bak, _dst)
+                    _bak.unlink()
 
         state.result_baseline_results = baseline_results_all
         state.step_message = "Setting up calibration environment..."
@@ -706,6 +778,9 @@ def _run_calibration_background(state: CalibrationState, config: dict):
             state.error_message = f"Calibration failed: {exc}"
             state.error_traceback = traceback.format_exc()
 
+    finally:
+        _cleanup_shared_cancel_file(_shared_cancel_file)
+
 
 # ---------------------------------------------------------------------------
 # Mode helpers
@@ -724,6 +799,83 @@ def _make_progress_callback(state: CalibrationState):
         if "total_iterations" in info:
             state.total_iterations = info["total_iterations"]
     return _cb
+
+
+def _attach_progress_polling(state: CalibrationState, setup):
+    """Set up file-based progress tracking that works in both seq and parallel modes.
+
+    SPOTPY's parallel mode (``parallel="mpc"``) pickles the setup to
+    worker processes via :py:meth:`SWATModelSetup.__getstate__`, which
+    intentionally nulls ``progress_callback`` (the callback's closure
+    references main-process state that can't cross process boundaries).
+    Workers therefore call ``simulation()`` and increment their local
+    ``_simulation_count`` but never report progress through the callback.
+
+    To make progress visible regardless of parallel mode and algorithm
+    (LHS, MC, DREAM, SCE-UA, ROPE, ...), we set ``setup._progress_counter_dir``
+    to a shared temp directory.  ``_report_progress()`` writes a file
+    ``{pid}.count`` containing the current per-process simulation count.
+    A daemon polling thread in *this* process aggregates those files
+    and updates ``state.simulation_count`` so the Streamlit UI fragment
+    can render the progress bar.
+
+    In sequential mode the in-memory ``progress_callback`` ALSO fires
+    and updates state immediately; the file polling is harmless because
+    ``state.simulation_count`` is monotonic.
+
+    Returns
+    -------
+    (stop_event, counter_dir) : tuple
+        The caller is responsible for ``stop_event.set()`` and removing
+        ``counter_dir`` when calibration completes (typically in a
+        ``finally`` block via :func:`_detach_progress_polling`).
+    """
+    import tempfile
+    from pathlib import Path
+
+    counter_dir = Path(tempfile.mkdtemp(prefix="swat_cal_progress_"))
+    setup._progress_counter_dir = str(counter_dir)
+
+    stop_event = threading.Event()
+
+    def _poll():
+        while not stop_event.is_set():
+            total = 0
+            try:
+                for f in counter_dir.glob("*.count"):
+                    try:
+                        total += int(f.read_text().strip() or "0")
+                    except (ValueError, OSError):
+                        pass
+            except OSError:
+                pass
+            if total > 0:
+                # Property setter is monotonic — only updates if greater.
+                state.simulation_count = total
+                if state.start_time:
+                    elapsed = time.time() - state.start_time
+                    state.elapsed_seconds = elapsed
+                    state.avg_time_per_sim = elapsed / total
+            stop_event.wait(1.5)
+
+    thread = threading.Thread(
+        target=_poll, daemon=True, name="swat-cal-progress-poll",
+    )
+    thread.start()
+    return stop_event, counter_dir
+
+
+def _detach_progress_polling(stop_event, counter_dir):
+    """Stop the polling thread and remove the temporary counter directory."""
+    try:
+        stop_event.set()
+    except Exception:
+        pass
+    try:
+        import shutil
+        shutil.rmtree(str(counter_dir), ignore_errors=True)
+    except Exception:
+        pass
 
 
 def _make_sequential_callback(state: CalibrationState):
@@ -757,7 +909,7 @@ def _run_single_site(state: CalibrationState, config: dict, model):
         kwargs["custom_sim_period"] = config["custom_sim_period"]
 
     if config.get("use_custom_boundaries") and config.get("boundary_manager"):
-        kwargs["parameter_set"] = config["boundary_manager"].to_parameter_set()
+        kwargs["parameters"] = config["boundary_manager"].to_parameter_set()
 
     if config.get("use_partial_basin"):
         kwargs["partial_basin_reach"] = config["single_reach"]
@@ -765,18 +917,31 @@ def _run_single_site(state: CalibrationState, config: dict, model):
     calibrator = Calibrator(**kwargs)
     calibrator._setup._cancel_state = state
     calibrator._setup._cancel_event = state.cancel_event
+    # Cross-process cancel: set the shared cancel-flag path so parallel
+    # SPOTPY workers (which cannot share threading.Event) detect cancel.
+    _cancel_file_path = config.get("_cancel_file_path")
+    if _cancel_file_path:
+        calibrator._setup._cancel_file = _cancel_file_path
     state.register_working_dir(str(calibrator._setup._working_dir))
-    results = calibrator.auto_calibrate(
-        n_iterations=config["n_iterations"],
-        algorithm=config["algorithm"][1],
-        parallel=config.get("use_parallel", False),
-        n_cores=config.get("n_cores"),
-        verbose=False,
-        progress_callback=_make_progress_callback(state),
-        n_ensemble_workers=config.get("n_ensemble_workers", 4),
-        kge_target=config.get("kge_target", 0.70),
-        pbias_target=config.get("pbias_target", 10.0),
-    )
+
+    # File-based progress polling — required so SPOTPY parallel workers
+    # (which lose the in-memory progress_callback during pickling) can
+    # still report progress to the UI.  Also harmlessly active in seq mode.
+    _poll_stop, _poll_dir = _attach_progress_polling(state, calibrator._setup)
+    try:
+        results = calibrator.auto_calibrate(
+            n_iterations=config["n_iterations"],
+            algorithm=config["algorithm"][1],
+            parallel=config.get("use_parallel", False),
+            n_cores=config.get("n_cores"),
+            verbose=False,
+            progress_callback=_make_progress_callback(state),
+            n_ensemble_workers=config.get("n_ensemble_workers", 4),
+            kge_target=config.get("kge_target", 0.70),
+            pbias_target=config.get("pbias_target", 10.0),
+        )
+    finally:
+        _detach_progress_polling(_poll_stop, _poll_dir)
     _check_cancel(state)
 
     results.reach_id = config["single_reach"]
@@ -835,16 +1000,30 @@ def _run_simultaneous(state: CalibrationState, config: dict, model):
     calibrator = Calibrator(**kwargs)
     calibrator._setup._cancel_state = state
     calibrator._setup._cancel_event = state.cancel_event
+    _cancel_file_path = config.get("_cancel_file_path")
+    if _cancel_file_path:
+        calibrator._setup._cancel_file = _cancel_file_path
     state.register_working_dir(str(calibrator._setup._working_dir))
-    results = calibrator.multi_site_calibrate(
-        sites=sites,
-        mode="simultaneous",
-        n_iterations=config["n_iterations"],
-        algorithm=config["algorithm"][1],
-        parallel=config.get("use_parallel", False),
-        verbose=False,
-        progress_callback=_make_progress_callback(state),
-    )
+
+    # File-based progress polling — Calibrator.multi_site_calibrate creates
+    # a fresh MultiSiteSetup internally, so we pass the counter directory
+    # through ``progress_counter_dir`` so it lands on the inner setup.
+    _poll_stop, _poll_dir = _attach_progress_polling(state, calibrator._setup)
+    try:
+        results = calibrator.multi_site_calibrate(
+            sites=sites,
+            mode="simultaneous",
+            n_iterations=config["n_iterations"],
+            algorithm=config["algorithm"][1],
+            parallel=config.get("use_parallel", False),
+            verbose=False,
+            progress_callback=_make_progress_callback(state),
+            progress_counter_dir=str(_poll_dir),
+            cancel_state=state,
+            cancel_file=_cancel_file_path,
+        )
+    finally:
+        _detach_progress_polling(_poll_stop, _poll_dir)
     _check_cancel(state)
 
     state.result_calibration_result = results.metrics
@@ -883,6 +1062,44 @@ def _run_sequential(state: CalibrationState, config: dict, model):
             upstream_subbasins=site.get("upstream_subbasins"),
         )
 
+    # SequentialCalibrator runs N steps × n_iterations sims; the UI bar
+    # tracks total accumulated SWAT runs across all steps.
+    _n_steps_seq = len(config.get("calibration_sites", []))
+    if _n_steps_seq > 1:
+        state.total_iterations = config["n_iterations"] * _n_steps_seq
+
+    # File-based progress counter — shared across all sequential steps.
+    # Each step's SubbasinGroupSetup writes per-PID counts here; the
+    # polling thread aggregates them and updates state.simulation_count.
+    import tempfile
+    from pathlib import Path
+    _seq_counter_dir = Path(tempfile.mkdtemp(prefix="swat_cal_progress_"))
+    _seq_poll_stop = threading.Event()
+
+    def _seq_poll():
+        while not _seq_poll_stop.is_set():
+            total = 0
+            try:
+                for f in _seq_counter_dir.glob("*.count"):
+                    try:
+                        total += int(f.read_text().strip() or "0")
+                    except (ValueError, OSError):
+                        pass
+            except OSError:
+                pass
+            if total > 0:
+                state.simulation_count = total
+                if state.start_time:
+                    elapsed = time.time() - state.start_time
+                    state.elapsed_seconds = elapsed
+                    state.avg_time_per_sim = elapsed / total
+            _seq_poll_stop.wait(1.5)
+
+    _seq_poll_thread = threading.Thread(
+        target=_seq_poll, daemon=True, name="swat-seq-progress-poll",
+    )
+    _seq_poll_thread.start()
+
     _seq_kwargs: dict = dict(
         parameters=config["selected_params"],
         n_iterations=config["n_iterations"],
@@ -895,11 +1112,21 @@ def _run_sequential(state: CalibrationState, config: dict, model):
         progress_callback=_make_sequential_callback(state),
         print_code=config.get("calibration_print_code"),
         cancel_state=state,
+        cancel_file=config.get("_cancel_file_path"),
+        progress_counter_dir=str(_seq_counter_dir),
     )
     if config.get("custom_sim_period"):
         _seq_kwargs["custom_sim_period"] = config["custom_sim_period"]
 
-    seq_results = seq.run(**_seq_kwargs)
+    try:
+        seq_results = seq.run(**_seq_kwargs)
+    finally:
+        _seq_poll_stop.set()
+        try:
+            import shutil as _sh
+            _sh.rmtree(str(_seq_counter_dir), ignore_errors=True)
+        except Exception:
+            pass
     _check_cancel(state)
 
     state.result_sequential_results = seq_results
@@ -997,6 +1224,8 @@ def _run_diagnostic_sequential(state: CalibrationState, config: dict, model):
         n_ensemble_workers=_n_workers,
         custom_sim_period=config.get("custom_sim_period"),
         cancel_state=state,
+        cancel_file=config.get("_cancel_file_path"),
+        print_code=config.get("calibration_print_code"),
     )
     _check_cancel(state)
 
@@ -1072,6 +1301,9 @@ def _run_partial_section_spotpy(state: CalibrationState, config: dict, model):
     setup = SubbasinGroupSetup(**setup_kwargs)
     setup._cancel_state = state
     setup._cancel_event = state.cancel_event
+    _cancel_file_path = config.get("_cancel_file_path")
+    if _cancel_file_path:
+        setup._cancel_file = _cancel_file_path
     state.register_working_dir(str(setup._working_dir))
 
     # Build a lightweight Calibrator wrapper around the SubbasinGroupSetup
@@ -1098,17 +1330,23 @@ def _run_partial_section_spotpy(state: CalibrationState, config: dict, model):
     calibrator._setup.cleanup()
     calibrator._setup = setup
 
-    results = calibrator.auto_calibrate(
-        n_iterations=config["n_iterations"],
-        algorithm=config["algorithm"][1],
-        parallel=config.get("use_parallel", False),
-        n_cores=config.get("n_cores"),
-        verbose=False,
-        progress_callback=_make_progress_callback(state),
-        n_ensemble_workers=config.get("n_ensemble_workers", 4),
-        kge_target=config.get("kge_target", 0.70),
-        pbias_target=config.get("pbias_target", 10.0),
-    )
+    # File-based progress polling — needed so SPOTPY parallel workers
+    # report sim count back to the UI.
+    _poll_stop, _poll_dir = _attach_progress_polling(state, calibrator._setup)
+    try:
+        results = calibrator.auto_calibrate(
+            n_iterations=config["n_iterations"],
+            algorithm=config["algorithm"][1],
+            parallel=config.get("use_parallel", False),
+            n_cores=config.get("n_cores"),
+            verbose=False,
+            progress_callback=_make_progress_callback(state),
+            n_ensemble_workers=config.get("n_ensemble_workers", 4),
+            kge_target=config.get("kge_target", 0.70),
+            pbias_target=config.get("pbias_target", 10.0),
+        )
+    finally:
+        _detach_progress_polling(_poll_stop, _poll_dir)
     _check_cancel(state)
 
     results.reach_id = config["single_reach"]
@@ -1194,6 +1432,8 @@ def _run_partial_section_diagnostic(state: CalibrationState, config: dict, model
         print_code=config.get("calibration_print_code"),
     )
 
+    _cancel_file_path = config.get("_cancel_file_path")
+
     if _is_ensemble:
         from swat_modern.calibration.diagnostic_calibrator import (
             EnsembleDiagnosticCalibrator,
@@ -1205,6 +1445,10 @@ def _run_partial_section_diagnostic(state: CalibrationState, config: dict, model
             n_workers=_n_workers,
             **diag_kwargs,
         )
+        # EnsembleDiagnosticCalibrator manages its own cancel file and
+        # registers it on ``state`` inside ``calibrate()`` — nothing to
+        # inject here.  The shared cancel file + the ensemble's own file
+        # are both written by ``state.request_cancel()``.
     else:
         from swat_modern.calibration.diagnostic_calibrator import (
             DiagnosticCalibrator,
@@ -1215,6 +1459,10 @@ def _run_partial_section_diagnostic(state: CalibrationState, config: dict, model
             observed_df=config["single_site_observed"],
             **diag_kwargs,
         )
+        # Non-ensemble: propagate the shared cross-process cancel flag
+        # so ``DiagnosticCalibrator._check_cancel`` sees file-based cancel.
+        if _cancel_file_path:
+            calibrator._cancel_file = _cancel_file_path
 
     # Register working dir for cleanup on cancel
     if hasattr(calibrator, "_working_dir") and calibrator._working_dir:
@@ -1310,6 +1558,12 @@ def _run_multi_constituent(state: CalibrationState, config: dict, model):
         warmup_years=config.get("warmup_years", 1),
         progress_callback=_phased_progress,
         cancel_state=state,
+        cancel_file=config.get("_cancel_file_path"),
+        kge_target=config.get("kge_target", 0.70),
+        pbias_target=config.get("pbias_target", 10.0),
+        parallel=config.get("use_parallel", False),
+        n_cores=config.get("n_cores"),
+        n_ensemble_workers=config.get("n_ensemble_workers", 4),
         **extra_kwargs,
     )
     # Register working dir for cleanup on cancel
@@ -1420,7 +1674,7 @@ def _run_sensitivity_background(state: CalibrationState, config: dict):
             if config.get("custom_sim_period"):
                 kwargs["custom_sim_period"] = config["custom_sim_period"]
             if config.get("use_custom_boundaries") and config.get("boundary_manager"):
-                kwargs["parameter_set"] = config["boundary_manager"].to_parameter_set()
+                kwargs["parameters"] = config["boundary_manager"].to_parameter_set()
 
             calibrator = Calibrator(**kwargs)
 
@@ -1475,7 +1729,7 @@ def _run_sensitivity_background(state: CalibrationState, config: dict):
                 kwargs["custom_sim_period"] = config["custom_sim_period"]
 
             if config.get("use_custom_boundaries") and config.get("boundary_manager"):
-                kwargs["parameter_set"] = config["boundary_manager"].to_parameter_set()
+                kwargs["parameters"] = config["boundary_manager"].to_parameter_set()
 
             if config.get("use_partial_basin"):
                 kwargs["partial_basin_reach"] = config["single_reach"]

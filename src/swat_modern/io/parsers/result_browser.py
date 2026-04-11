@@ -290,6 +290,29 @@ class ResultBrowser:
         if '_is_annual' in unit_df.columns:
             unit_df = unit_df[~unit_df['_is_annual']].copy()
 
+        # Strip summary rows from MON column based on IPRINT.
+        # Monthly output (IPRINT=0) has MON=1-12 for data, plus summary
+        # rows with MON > 12 (old-style: MON=13 or NBYR; Rev 692+:
+        # MON=year like 2005, plus the final avg-annual row MON=years).
+        # Daily output (IPRINT=1) has MON=1-366 with possible year-like
+        # summaries (MON > 366).
+        # Yearly output (IPRINT=2) has MON=year (e.g. 2005..2020), plus
+        # a final avg-annual row with MON=years (e.g. 16.0); strip the
+        # summary by requiring MON to be a plausible calendar year.
+        if 'MON' in unit_df.columns:
+            if self._print_code == 0:
+                # Monthly: keep only MON in [1, 12]
+                unit_df = unit_df[unit_df['MON'] <= 12].copy()
+            elif self._print_code == 2:
+                # Yearly: keep only rows whose MON looks like a real
+                # calendar year (>= simulation start year)
+                unit_df = unit_df[unit_df['MON'] >= self._start_year].copy()
+            else:
+                # Daily/unknown: strip year-like values (>366)
+                _year_like = unit_df['MON'] > 366
+                if _year_like.any() and not _year_like.all():
+                    unit_df = unit_df[~_year_like].copy()
+
         if len(unit_df) == 0:
             raise ValueError(f"No data found for {id_col}={unit_id}")
 
@@ -363,6 +386,21 @@ class ResultBrowser:
                 f"{sorted(upstream_reach_ids)}"
             )
 
+        # Strip summary rows before grouping (same logic as get_time_series)
+        if '_is_annual' in upstream_df.columns:
+            upstream_df = upstream_df[~upstream_df['_is_annual']].copy()
+        if 'MON' in upstream_df.columns:
+            if self._print_code == 0:
+                upstream_df = upstream_df[upstream_df['MON'] <= 12].copy()
+            elif self._print_code == 2:
+                upstream_df = upstream_df[
+                    upstream_df['MON'] >= self._start_year
+                ].copy()
+            else:
+                _year_like = upstream_df['MON'] > 366
+                if _year_like.any() and not _year_like.all():
+                    upstream_df = upstream_df[~_year_like].copy()
+
         # Assign within-reach row index for time-step grouping
         upstream_df["_ts_idx"] = upstream_df.groupby(id_col).cumcount()
 
@@ -372,17 +410,12 @@ class ResultBrowser:
         # Use one reach's rows as template (preserves MON/DAY/YEAR)
         one_sub = next(iter(upstream_reach_ids))
         template = (
-            df[df[id_col] == one_sub]
+            upstream_df[upstream_df[id_col] == one_sub]
             .copy()
             .reset_index(drop=True)
         )
         template[variable] = summed.values
         template[id_col] = label_id
-
-        # Filter annual summary rows from template before date reconstruction
-        if '_is_annual' in template.columns:
-            template = template[~template['_is_annual']].reset_index(drop=True)
-            template[variable] = summed.values[:len(template)]
 
         # Reconstruct dates from the template
         dates = self._reconstruct_dates(template)
@@ -562,14 +595,27 @@ class ResultBrowser:
 
             elif has_mon and not has_year:
                 mon_values = df["MON"].values
-                max_mon = int(max(mon_values))
 
-                if max_mon > 12:
-                    # Daily output: MON contains Julian day-of-year (1-366)
-                    return self._reconstruct_daily_dates(mon_values)
-                else:
-                    # Monthly output: MON contains month numbers 1-12
+                # Use IPRINT from file.cio to determine output format.
+                # IPRINT: 0=monthly, 1=daily, 2=yearly.  Summary rows
+                # should already be stripped by the caller
+                # (get_time_series / get_accumulated_time_series).
+                if self._print_code == 0:
                     return self._reconstruct_monthly_dates(mon_values)
+                elif self._print_code == 1:
+                    return self._reconstruct_daily_dates(mon_values)
+                elif self._print_code == 2:
+                    return self._reconstruct_yearly_dates(mon_values)
+                else:
+                    # Fallback heuristic for unknown print_code
+                    max_mon = int(max(mon_values))
+                    if max_mon >= self._start_year:
+                        # MON looks like a calendar year → yearly output
+                        return self._reconstruct_yearly_dates(mon_values)
+                    elif max_mon > 12:
+                        return self._reconstruct_daily_dates(mon_values)
+                    else:
+                        return self._reconstruct_monthly_dates(mon_values)
 
             elif has_mon and has_year:
                 # Has both MON and YEAR
@@ -633,4 +679,20 @@ class ResultBrowser:
                 # Annual summary row
                 dates.append(date(current_year, 12, 31))
 
+        return pd.DatetimeIndex(dates)
+
+    def _reconstruct_yearly_dates(self, mon_values) -> pd.DatetimeIndex:
+        """
+        Reconstruct dates for yearly output where MON = calendar year.
+
+        Used when SWAT is run with IPRINT=2, in which case rchyr.f
+        writes ``iyr`` (the current year, e.g. 2005..2020) into the MON
+        column position.  Callers must have already stripped the
+        avg-annual summary row that rchaa.f appends at the end.
+        """
+        dates = []
+        for year_val in mon_values:
+            year_int = int(year_val)
+            # Use Dec 31 to match monthly's end-of-period convention
+            dates.append(date(year_int, 12, 31))
         return pd.DatetimeIndex(dates)

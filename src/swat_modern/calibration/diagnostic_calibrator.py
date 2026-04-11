@@ -138,10 +138,15 @@ PHASE_PARAMS = {
     "finetune": ["GW_REVAP", "REVAPMN", "EPCO", "OV_N", "SOL_AWC", "CH_N2"],
 }
 
-# Sediment diagnostic phases
+# Sediment diagnostic phases.
+# PRF is a linear peak-rate scaler applied directly to channel transport
+# capacity in rtsed.f (peakr = prf(jrch) * sdti), so PRF=0.5 produces
+# exactly 0.5x sediment output. That makes it a primary *volume* lever,
+# not a dynamics refinement, so it lives in sed_volume alongside the
+# other first-order magnitude controls (SPCON, ADJ_PKR, USLE_P).
 SEDIMENT_PHASE_PARAMS = {
-    "sed_volume": ["USLE_P", "SPCON", "ADJ_PKR"],
-    "sed_dynamics": ["SPEXP", "CH_COV1", "CH_COV2", "PRF"],
+    "sed_volume": ["USLE_P", "SPCON", "ADJ_PKR", "PRF"],
+    "sed_dynamics": ["SPEXP", "CH_COV1", "CH_COV2"],
     "sed_finetune": ["LAT_SED", "USLE_K", "SLSUBBSN"],
 }
 
@@ -517,9 +522,17 @@ class DiagnosticCalibrator:
                 ("finetune", "kge", 1.0, 1.0 - self.kge_target),
             ]
         elif parent == "sediment":
+            # sed_dynamics uses "nse" (always computable from obs/sim)
+            # rather than "rating_slope_ratio" (requires an observed
+            # flow series, which isn't available when the observations
+            # come from wq-deferred load computation).  This matches
+            # the nitrogen/phosphorus phase pattern and ensures the
+            # dynamics phase actually runs instead of breaking on a
+            # NaN metric lookup.  rating_slope_ratio is still reported
+            # in the diagnostic summary for users who do provide flow.
             return SEDIMENT_PHASE_PARAMS, [
                 ("sed_volume", "total_pbias", 0.0, self.pbias_target),
-                ("sed_dynamics", "rating_slope_ratio", 1.0, 0.30),
+                ("sed_dynamics", "nse", 1.0, 1.0 - self.kge_target),
                 ("sed_finetune", "kge", 1.0, 1.0 - self.kge_target),
             ]
         elif parent == "nitrogen":
@@ -583,9 +596,20 @@ class DiagnosticCalibrator:
                 return self._build_result(self._total_runs(), time.time() - t0,
                                           True, "Baseline already satisfactory")
 
-            # Iterate through phases in multiple passes
-            max_passes = 3
+            # Iterate through phases in multiple passes.
+            #
+            # `max_passes` is an upper bound — the real termination
+            # criterion is `_total_runs() >= max_iterations`.  Passes
+            # get progressively smaller per_phase budgets so later
+            # passes refine rather than repeat.
+            max_passes = 5
             prev_pass_kge = -np.inf
+            stagnant_passes = 0
+
+            # Dispatch to constituent-specific phase sequence (static
+            # for the whole calibration).
+            phase_params_dict, phase_configs = self._get_phase_sequence()
+            n_phases = max(1, len(phase_configs))
 
             for pass_num in range(max_passes):
                 if self._total_runs() >= self.max_iterations:
@@ -613,12 +637,23 @@ class DiagnosticCalibrator:
                                 True, f"Converged on re-evaluation (pass {pass_num+1})",
                             )
 
-                # Reduce max per-phase runs on later passes (more cautious)
-                per_phase = max(1, 3 - pass_num)
-                damping_scale = 1.0 / (1 + pass_num * 0.5)  # 1.0, 0.67, 0.5
-
-                # Dispatch to constituent-specific phase sequence
-                phase_params_dict, phase_configs = self._get_phase_sequence()
+                # Per-phase budget.
+                #
+                # Previous behaviour: `per_phase = max(1, 3 - pass_num)`
+                # gave 3,2,1,1,1 regardless of how many runs the prior
+                # pass actually consumed.  When phases break early (e.g.
+                # the baseline is far from target and `_previous_phases_ok`
+                # fires), the iteration budget goes unused.
+                #
+                # New behaviour: allocate the REMAINING budget across
+                # the remaining phases so every run the user paid for
+                # gets exercised.  We floor at 2 so each phase gets at
+                # least one secant-method step after the initial
+                # proportional step.
+                remaining_budget = max(0, self.max_iterations - self._total_runs())
+                allocated = max(2, remaining_budget // n_phases)
+                per_phase = min(allocated, 3 + pass_num)  # cap growth per pass
+                damping_scale = 1.0 / (1 + pass_num * 0.5)  # 1.0, 0.67, 0.5, ...
 
                 for phase_name, metric_key, target, threshold in phase_configs:
                     if self._total_runs() >= self.max_iterations:
@@ -637,10 +672,22 @@ class DiagnosticCalibrator:
                             True, f"Converged after {phase_name} (pass {pass_num+1})",
                         )
 
-                # Check cross-pass stagnation
+                # Cross-pass stagnation.
+                #
+                # Philosophy: `max_iterations` is the user's budget.
+                # Only break early when the calibrator is genuinely
+                # stuck — defined as TWO consecutive passes producing
+                # negligible KGE improvement (< 0.001).  A single
+                # stagnant pass is not enough, because the next pass
+                # uses the best params discovered so far and may find
+                # progress in a different phase.
                 current_kge = self._best_metrics.get("kge", -np.inf)
-                if current_kge - prev_pass_kge < 0.01:
-                    # No meaningful KGE improvement this pass
+                _improvement = current_kge - prev_pass_kge
+                if _improvement < 0.001:
+                    stagnant_passes += 1
+                else:
+                    stagnant_passes = 0
+                if stagnant_passes >= 2:
                     break
                 prev_pass_kge = current_kge
 
@@ -771,6 +818,7 @@ class DiagnosticCalibrator:
         damping = damping_override if damping_override is not None else self.damping
         runs = 0
         prev_metric = None
+        stagnant_iters = 0  # count consecutive iterations with no progress
 
         for step_i in range(max_phase_runs):
             if self._total_runs() >= self.max_iterations:
@@ -779,9 +827,12 @@ class DiagnosticCalibrator:
 
             # Compute adjustments for each parameter.
             # First pass: identify which params need adjusting.
-            # Second pass: compute adjustments with n_concurrent so each
-            # param's step is scaled down when multiple params move at once
-            # (prevents compounding overshoots).
+            # Second pass: compute adjustments with n_concurrent counted
+            # only over params that will actually move (non-clamped).
+            # Dividing by the full candidate count — even when several
+            # params are pinned at their bounds — slashes the step size
+            # unnecessarily and makes progress glacial when the model is
+            # far from target.
             candidates = []
             last_step = self._steps[-1] if self._steps else None
             if last_step is None:
@@ -800,10 +851,38 @@ class DiagnosticCalibrator:
                 direction = self._infer_direction(pname, phase_name, error)
                 candidates.append((pname, cparam, direction))
 
-            n_concurrent = max(len(candidates), 1)
+            # First pass: compute a raw per-param adjustment WITHOUT the
+            # n_concurrent scaling so we can see which params will
+            # actually move given the current bounds.  Then pick
+            # n_concurrent as the count of movable params.
+            raw_adjustments = {}
+            for pname, cparam, direction in candidates:
+                adj = estimate_adjustment(
+                    parameter=pname,
+                    direction=direction,
+                    error_magnitude=error,
+                    param_range=(cparam.min_value, cparam.max_value),
+                    sensitivity_weight=0.5,
+                    history=self._param_history.get(pname),
+                    damping=damping,
+                    n_concurrent=1,
+                )
+                if abs(adj) < 1e-10:
+                    continue
+                old_val = self._current_values[pname]
+                new_val_clamped = max(
+                    cparam.min_value, min(cparam.max_value, old_val + adj),
+                )
+                new_val_rounded = round(new_val_clamped, cparam.decimal_precision)
+                if new_val_rounded == round(old_val, cparam.decimal_precision):
+                    # Would not move — exclude from n_concurrent accounting.
+                    continue
+                raw_adjustments[pname] = (cparam, direction)
+
+            n_concurrent = max(len(raw_adjustments), 1)
 
             adjustments = {}
-            for pname, cparam, direction in candidates:
+            for pname, (cparam, direction) in raw_adjustments.items():
                 adj = estimate_adjustment(
                     parameter=pname,
                     direction=direction,
@@ -870,12 +949,30 @@ class DiagnosticCalibrator:
                 self._current_values = new_values
                 break
 
-            # Check stagnation
+            # Check stagnation.
+            #
+            # The old check broke the phase on any improvement smaller
+            # than 0.01 absolute (improvement > -0.01) even when the
+            # metric was clearly still improving — e.g. NSE 0.1281 →
+            # 0.1285 (improvement = -0.0004) triggered a false-positive
+            # break that terminated sed_dynamics after a single run.
+            #
+            # New rule: break only when BOTH of the following hold
+            #   (a) the metric did NOT improve (new error >= prev error),
+            #   (b) we've already seen this twice in a row.
+            # Any real improvement resets the counter.  This lets slow-
+            # but-steady progress continue to consume the iteration
+            # budget instead of being killed on the first flat step.
             if prev_metric is not None and new_metric is not None:
                 improvement = abs(new_metric - target) - abs(prev_metric - target)
-                if improvement > -0.01 * abs(target or 1):
-                    # No meaningful improvement
-                    break
+                # improvement < 0 means error shrank (progress).
+                # improvement >= 0 means no progress or regression.
+                if improvement >= 0:
+                    stagnant_iters += 1
+                    if stagnant_iters >= 2:
+                        break
+                else:
+                    stagnant_iters = 0
 
             prev_metric = new_metric
 
@@ -1061,7 +1158,15 @@ class DiagnosticCalibrator:
 
         sim = baseline["simulated"]
         dates = baseline["dates"]
-        obs = self.observed_df["observed"].values.astype(float)
+        # Use the date-aligned merged observations from run_baseline_simulation
+        # (already aggregated to the calibration timestep in _merge_sim_obs).
+        # Falling back to raw self.observed_df["observed"] would mismatch months
+        # in monthly mode (183 raw sparse loads vs 179 monthly-aggregated sim).
+        obs = baseline.get("observed")
+        if obs is None:
+            obs = self.observed_df["observed"].values.astype(float)
+        else:
+            obs = np.asarray(obs, dtype=float)
 
         # Align lengths
         n = min(len(obs), len(sim))
@@ -1174,6 +1279,14 @@ class DiagnosticCalibrator:
 
         For flow: checks volume (PBIAS) and baseflow (BFI) from prior phases.
         For WQ: only checks volume (PBIAS) since BFI doesn't apply.
+
+        Uses a *relative* tolerance: the check only fails if the current
+        PBIAS/BFI has drifted significantly *worse* than the baseline (the
+        metric at the start of the calibration).  An absolute threshold
+        like ``pbias_target * 1.5`` fails immediately when the baseline
+        is already way off target (e.g. PBIAS=-59% with pbias_target=10%),
+        causing dynamics/finetune phases to break after a single run and
+        consume only a fraction of the user's iteration budget.
         """
         if not self._steps:
             return True
@@ -1197,11 +1310,33 @@ class DiagnosticCalibrator:
             if current_phase in phase_order else 0
         )
 
-        # Volume target: |PBIAS| <= pbias_target * 1.5 (allow some slack)
+        # Baseline PBIAS for relative comparison (first recorded step).
+        baseline_pbias = None
+        if self._steps:
+            baseline_pbias = self._steps[0].diagnostic_summary.get(
+                "total_pbias", None,
+            )
+
+        # Volume target check — accept if EITHER the absolute target is
+        # met (|PBIAS| <= 1.5x target) OR the current PBIAS is no more
+        # than 10% worse than the baseline.  This lets dynamics/finetune
+        # phases still run when the baseline PBIAS is well beyond the
+        # user's target (common for WQ calibration), while still
+        # catching phases that make volume dramatically worse.
         if current_idx > 0:
             tp = diag.get("total_pbias", 0)
-            if tp is not None and not np.isnan(tp) and abs(tp) > self.pbias_target * 1.5:
-                return False
+            if tp is not None and not np.isnan(tp):
+                abs_ok = abs(tp) <= self.pbias_target * 1.5
+                rel_ok = True
+                if (
+                    baseline_pbias is not None
+                    and not np.isnan(baseline_pbias)
+                ):
+                    # Allow PBIAS to be up to 10 percentage points worse
+                    # than baseline before we call it "broken".
+                    rel_ok = abs(tp) <= abs(baseline_pbias) + 10.0
+                if not (abs_ok or rel_ok):
+                    return False
 
         # Baseflow target (flow only): |BFI_ratio - 1| <= 0.25
         if parent == "flow" and current_idx > 1:
@@ -1478,6 +1613,7 @@ def _ensemble_worker(
         progress_callback=_file_progress_cb,
         constituent=kwargs.get("constituent", "flow"),
         partial_basin_reach=kwargs.get("partial_basin_reach"),
+        print_code=kwargs.get("print_code"),
         _use_working_copy=False,  # worker already has its own dir copy
     )
     # File-based cancel for cross-process cancellation

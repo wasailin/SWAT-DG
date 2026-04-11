@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swat-dg"
-version = "0.5.0"
+version = "0.6.0"
 description = "Python wrapper and automation tools for SWAT2012 hydrological model"
 readme = "README.md"
 license = {text = "Apache-2.0"}

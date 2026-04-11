@@ -320,6 +320,8 @@ def _wq_observation_ui(
             _wq_df = calculate_total_phosphorus(_wq_df)
 
             if _wq_df is not None and not _wq_df.empty:
+                # Store the full WQ DataFrame for multi-constituent mode
+                st.session_state[f"{key_prefix}_wq_full"] = _wq_df
                 _n_vals = _wq_df[_wq_col].notna().sum() if _wq_col in _wq_df.columns else 0
                 _avail = []
                 for _c, _l in [
@@ -366,8 +368,46 @@ def _wq_observation_ui(
                 if _n_vals == 0:
                     st.warning(
                         f"No **{_wq_col}** data found for constituent **{_constituent}**. "
-                        f"Check that the file contains this parameter."
+                        f"You can map a column from your file below, or check that "
+                        f"the file contains this parameter."
                     )
+                    # --- Column mapping fallback for any mode ---
+                    # Show file columns that have numeric data so the user
+                    # can manually pick which column corresponds to the
+                    # required constituent.
+                    _mappable_cols = [
+                        c for c in _wq_df.columns
+                        if c != "date"
+                        and _wq_df[c].notna().sum() > 0
+                    ]
+                    if _mappable_cols:
+                        _map_opts = ["(none — skip)"] + _mappable_cols
+                        _user_mapped = st.selectbox(
+                            f"Map a file column to **{_wq_col}** ({_constituent})",
+                            options=_map_opts,
+                            key=f"{key_prefix}_col_map_{_constituent}",
+                            help=(
+                                "Select the column that contains concentration "
+                                "data (mg/L) for this constituent."
+                            ),
+                        )
+                        if _user_mapped != "(none — skip)":
+                            _wq_df[_wq_col] = pd.to_numeric(
+                                _wq_df[_user_mapped], errors="coerce"
+                            )
+                            _n_vals = _wq_df[_wq_col].notna().sum()
+                            if _n_vals > 0:
+                                st.success(
+                                    f"Mapped `{_user_mapped}` → `{_wq_col}`: "
+                                    f"**{_n_vals}** values"
+                                )
+                                # Update stored full DataFrame
+                                st.session_state[f"{key_prefix}_wq_full"] = _wq_df
+                            else:
+                                st.error(
+                                    f"Column `{_user_mapped}` has no valid "
+                                    f"numeric values."
+                                )
             else:
                 st.warning("WQ file loaded but contains no data rows.")
                 _wq_df = None
@@ -899,8 +939,8 @@ if not use_custom_boundaries:
                             param_name, disabled=True,
                             key=_pkey,
                         )
-                    elif st.checkbox(param_name, key=_pkey):
-                        selected_params.append(param_name)
+                    else:
+                        st.checkbox(param_name, key=_pkey)
 
                 with col2:
                     st.caption(param_info["desc"])
@@ -911,6 +951,14 @@ if not use_custom_boundaries:
                 with col4:
                     st.caption(f"Method: {param_info['method']}")
 
+    # Rebuild selected_params from session state keys — these persist
+    # across Streamlit reruns even when expanders are collapsed.
+    selected_params = [
+        param_name
+        for category, params in PARAMETERS.items()
+        for param_name in params
+        if st.session_state.get(f"param_{param_name}", False)
+    ]
     st.session_state.selected_params = selected_params
 
     st.info(f"**Selected:** {len(selected_params)} parameters: {', '.join(selected_params) if selected_params else 'None'}")
@@ -1137,6 +1185,76 @@ if calibration_mode == "multi_constituent":
         elif "wq_load_data" in st.session_state:
             st.session_state._mc_wq_obs = st.session_state.wq_load_data
             st.caption("Using WQ load data from session (previously computed).")
+
+        # --- Column availability check & manual mapping for WQ phases ---
+        _PHASE_REQUIRED_COL = {
+            "sediment": "TSS_mg_L",
+            "nitrogen": "TN_mg_L",
+            "phosphorus": "TP_mg_L",
+        }
+        # Get the full WQ DataFrame (from deferred dict or direct store)
+        _mc_deferred_check = st.session_state.get("mc_wq_wq_deferred")
+        _wq_full_check = None
+        if _mc_deferred_check and isinstance(_mc_deferred_check, dict):
+            _wq_full_check = _mc_deferred_check.get("wq_df")
+        if _wq_full_check is None:
+            _wq_full_check = st.session_state.get("mc_wq_wq_full")
+
+        if _wq_full_check is not None and not _wq_full_check.empty:
+            _missing_phases = []
+            for _wp in _wq_phases_enabled:
+                _req_col = _PHASE_REQUIRED_COL.get(_wp.name)
+                if _req_col and (
+                    _req_col not in _wq_full_check.columns
+                    or _wq_full_check[_req_col].notna().sum() == 0
+                ):
+                    _missing_phases.append((_wp.name, _req_col))
+
+            if _missing_phases:
+                st.markdown("---")
+                st.warning(
+                    "The following enabled WQ phases have **no observation data** in the uploaded file: "
+                    + ", ".join(f"**{n.capitalize()}** (needs `{c}`)" for n, c in _missing_phases)
+                    + ". You can either **disable** those phases above, or **map columns** below."
+                )
+
+                # Let user map from file columns to required canonical columns
+                _file_numeric_cols = [
+                    c for c in _wq_full_check.columns
+                    if c != "date" and _wq_full_check[c].dtype in ("float64", "int64", "object")
+                    and _wq_full_check[c].notna().sum() > 0
+                ]
+                if _file_numeric_cols:
+                    with st.expander("Manual Column Mapping", expanded=True):
+                        st.caption(
+                            "Map columns from your WQ file to the required constituent columns. "
+                            "Select '(none)' to skip a constituent."
+                        )
+                        _mapping_changed = False
+                        for _phase_name, _req_col in _missing_phases:
+                            _opts = ["(none)"] + _file_numeric_cols
+                            _mapped = st.selectbox(
+                                f"{_phase_name.capitalize()} → `{_req_col}`",
+                                options=_opts,
+                                key=f"mc_wq_map_{_phase_name}",
+                            )
+                            if _mapped != "(none)":
+                                _wq_full_check[_req_col] = pd.to_numeric(
+                                    _wq_full_check[_mapped], errors="coerce"
+                                )
+                                _n = _wq_full_check[_req_col].notna().sum()
+                                if _n > 0:
+                                    st.success(f"Mapped `{_mapped}` → `{_req_col}`: {_n} values")
+                                    _mapping_changed = True
+                                else:
+                                    st.error(f"Column `{_mapped}` has no valid numeric values.")
+
+                        if _mapping_changed:
+                            # Update the stored full WQ DataFrame
+                            if _mc_deferred_check and isinstance(_mc_deferred_check, dict):
+                                _mc_deferred_check["wq_df"] = _wq_full_check
+                                st.session_state["mc_wq_wq_deferred"] = _mc_deferred_check
+                            st.session_state["mc_wq_wq_full"] = _wq_full_check
 
     # Store flow obs for config assembly
     st.session_state._mc_flow_obs = _mc_flow_obs
@@ -1648,8 +1766,13 @@ if calibration_mode == "single":
                             chosen_col = numeric_cols[0]
                         date_col = ObservationLoader.detect_date_column(single_site_observed)
                         keep = [c for c in [date_col, chosen_col] if c and c in single_site_observed.columns]
+                        _renames = {}
+                        if date_col and date_col != "date":
+                            _renames[date_col] = "date"
+                        if chosen_col != "observed":
+                            _renames[chosen_col] = "observed"
                         single_site_observed = single_site_observed[keep].rename(
-                            columns={chosen_col: "observed"} if chosen_col != "observed" else {}
+                            columns=_renames
                         )
                         _obs_vals = single_site_observed["observed"]
                         if (
@@ -1828,13 +1951,31 @@ with settings_col1:
         kge_target = 0.70
         pbias_target = 10.0
         iter_label = "Iterations per step" if calibration_mode == "sequential" else "Number of Iterations"
+        # DREAM requires nChains >= 7 (2*delta+1) for the chains to even
+        # initialize, and needs many more iterations beyond the burn-in to
+        # produce useful posterior samples. Enforce a higher floor and default
+        # for DREAM so users can't accidentally pick a value that fails or
+        # converges to nothing.
+        _is_dream = algorithm[1] == "dream"
+        if _is_dream:
+            _iter_min = 100
+            _iter_default = 2000
+            _iter_help = (
+                "DREAM uses 7 MCMC chains with burn-in. Minimum 100 iterations "
+                "is required for the sampler to initialize; 1000-5000+ is "
+                "recommended for meaningful posterior sampling."
+            )
+        else:
+            _iter_min = 2
+            _iter_default = 1000
+            _iter_help = "More iterations = better results but longer runtime"
         n_iterations = st.slider(
             iter_label,
-            min_value=2,
+            min_value=_iter_min,
             max_value=50000,
-            value=1000,
+            value=_iter_default,
             step=1,
-            help="More iterations = better results but longer runtime"
+            help=_iter_help,
         )
 
 with settings_col2:
@@ -2464,7 +2605,7 @@ if _sa_results is not None:
                 {"Parameter": k, "Value": round(v, 6)}
                 for k, v in _sa_best.items()
             ])
-            st.dataframe(_best_df, hide_index=True, use_container_width=True)
+            st.dataframe(_best_df, hide_index=True, width="stretch")
 
         if st.button("Narrow boundaries around best SA values", key="apply_sa_best"):
             from swat_modern.calibration.boundary_manager import BoundaryManager
@@ -2782,6 +2923,36 @@ else:
         if not _mc_enabled:
             st.warning("At least one phase must be enabled.")
             _can_start = False
+
+        # Validate WQ observation data for enabled WQ phases
+        _PHASE_REQ = {"sediment": "TSS_mg_L", "nitrogen": "TN_mg_L", "phosphorus": "TP_mg_L"}
+        _wq_enabled = [p for p in _mc_enabled if p.name in _PHASE_REQ]
+        if _wq_enabled:
+            _mc_d = st.session_state.get("mc_wq_wq_deferred")
+            _wq_check = None
+            if _mc_d and isinstance(_mc_d, dict):
+                _wq_check = _mc_d.get("wq_df")
+            if _wq_check is None:
+                _wq_check = st.session_state.get("mc_wq_wq_full")
+
+            _missing_wq = []
+            for _wp in _wq_enabled:
+                _rc = _PHASE_REQ[_wp.name]
+                if (
+                    _wq_check is None
+                    or _rc not in _wq_check.columns
+                    or _wq_check[_rc].notna().sum() == 0
+                ):
+                    _missing_wq.append(f"**{_wp.name.capitalize()}** (`{_rc}`)")
+
+            if _missing_wq:
+                st.warning(
+                    "The following WQ phases are enabled but have no observation data: "
+                    + ", ".join(_missing_wq)
+                    + ". Either upload WQ data with these columns, use the column mapping, "
+                    "or disable those phases."
+                )
+                _can_start = False
     elif not selected_params:
         st.warning("Please select at least one parameter to calibrate.")
         _can_start = False
@@ -2801,6 +2972,60 @@ else:
     ):
         st.warning("Multi-site calibration requires at least 2 sites with observation data.")
         _can_start = False
+
+    # --- WQ observation data quality check (all non-multi-constituent modes) ---
+    # When calibrating a WQ variable (SED_OUTtons, TOT_Nkg, etc.), verify
+    # the observation data actually has values for the target constituent.
+    # This catches cases where format auto-detection failed, columns didn't
+    # map, or the user uploaded the wrong file — BEFORE burning SWAT runs.
+    if (
+        _can_start
+        and calibration_mode != "multi_constituent"
+        and _is_wq_variable
+    ):
+        _wq_target_col = _CONSTITUENT_TO_WQ_COL.get(
+            _SWAT_VAR_TO_CONSTITUENT.get(cal_output_variable, ""), ""
+        )
+        _wq_target_const = _SWAT_VAR_TO_CONSTITUENT.get(cal_output_variable, "")
+
+        if calibration_mode in ("single", "partial_section"):
+            # Check the observation DataFrame — it should have 'observed' column
+            # with actual data. Also check the deferred WQ dict if present.
+            _obs_to_check = single_site_observed
+            if _obs_to_check is not None and isinstance(_obs_to_check, pd.DataFrame):
+                _obs_valid = (
+                    "observed" in _obs_to_check.columns
+                    and _obs_to_check["observed"].notna().sum() > 0
+                )
+                if not _obs_valid:
+                    _prefix = "single_wq" if calibration_mode == "single" else "ps_wq"
+                    st.warning(
+                        f"The observation data for **{cal_output_variable}** "
+                        f"({_wq_target_const}) has no valid values. "
+                        f"Please upload a WQ file with **{_wq_target_col}** data "
+                        f"or use the column mapping to select the right column."
+                    )
+                    _can_start = False
+
+        elif calibration_mode in ("simultaneous", "sequential"):
+            # Check each site's observation data
+            _bad_sites = []
+            for _si, _site in enumerate(calibration_sites):
+                _site_obs = _site.get("observed")
+                if _site_obs is not None and isinstance(_site_obs, pd.DataFrame):
+                    if (
+                        "observed" not in _site_obs.columns
+                        or _site_obs["observed"].notna().sum() == 0
+                    ):
+                        _bad_sites.append(f"Site {_si + 1} (reach {_site.get('reach_id', '?')})")
+            if _bad_sites:
+                st.warning(
+                    f"The following sites have no valid **{_wq_target_col}** "
+                    f"({_wq_target_const}) observation data: "
+                    + ", ".join(_bad_sites)
+                    + ". Please check the WQ file and column mapping."
+                )
+                _can_start = False
 
     if _can_start and st.button(f"Start {mode_label} Calibration", type="primary"):
         # Build config dict for the background thread
@@ -2833,7 +3058,18 @@ else:
             _config["phased_config"] = st.session_state.get("_phased_config", [])
             _config["single_reach"] = st.session_state.get("_mc_reach", 1)
             _config["single_site_observed"] = st.session_state.get("_mc_flow_obs")
-            if st.session_state.get("_mc_wq_obs") is not None:
+            # For multi-constituent, PhasedCalibrator needs the full WQ
+            # DataFrame with canonical columns (TSS_mg_L, TN_mg_L, TP_mg_L, …),
+            # NOT the single-column [date, observed] returned by _wq_observation_ui.
+            # The deferred dict stores the full WQ DataFrame.
+            # Priority: deferred dict → full WQ DataFrame → single-column fallback
+            _mc_deferred = st.session_state.get("mc_wq_wq_deferred")
+            _mc_wq_full = st.session_state.get("mc_wq_wq_full")
+            if _mc_deferred and isinstance(_mc_deferred, dict) and "wq_df" in _mc_deferred:
+                _config["wq_observations"] = _mc_deferred["wq_df"]
+            elif _mc_wq_full is not None:
+                _config["wq_observations"] = _mc_wq_full
+            elif st.session_state.get("_mc_wq_obs") is not None:
                 _config["wq_observations"] = st.session_state._mc_wq_obs
             elif "wq_load_data" in st.session_state:
                 _config["wq_observations"] = st.session_state.wq_load_data
@@ -3055,7 +3291,7 @@ if "calibration_result" in st.session_state:
                         _row[_mk.upper()] = f"{_mv:.4f}"
             _phase_rows.append(_row)
 
-        st.dataframe(pd.DataFrame(_phase_rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(_phase_rows), hide_index=True, width="stretch")
 
         # Per-phase parameter details
         for _pr in _phased_res.phase_results:

@@ -242,7 +242,7 @@ try:
             ylabel=variable,
             show_rangeslider=True,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         # Summary statistics
         stats_col1, stats_col2, stats_col3, stats_col4, stats_col5 = st.columns(5)
@@ -320,6 +320,14 @@ with st.expander("Compare multiple units", expanded=False):
                         from folium.features import GeoJsonTooltip
                         from branca.element import MacroElement
                         from jinja2 import Template
+
+                        # Sync from multiselect widget key → shared state
+                        # so the map reflects dropdown changes on the same rerun
+                        if "compare_multiselect" in st.session_state:
+                            st.session_state.compare_selected_units = [
+                                u for u in st.session_state.compare_multiselect
+                                if u in valid_ids
+                            ]
 
                         selected_set = set(st.session_state.compare_selected_units)
 
@@ -547,6 +555,7 @@ with st.expander("Compare multiple units", expanded=False):
                                             else:
                                                 sel.append(clicked_id)
                                             st.session_state.compare_selected_units = sel
+                                            st.session_state.compare_multiselect = sel
                                             st.rerun()
                                         break
 
@@ -580,7 +589,7 @@ with st.expander("Compare multiple units", expanded=False):
                                         title=f"{variable} - Comparison",
                                         ylabel=variable,
                                     )
-                                    st.plotly_chart(_fig, use_container_width=True)
+                                    st.plotly_chart(_fig, width="stretch")
                             except Exception as _e:
                                 st.error(f"Error comparing units: {_e}")
 
@@ -618,7 +627,7 @@ with st.expander("Compare multiple units", expanded=False):
                             title=f"{variable} - Comparison",
                             ylabel=variable,
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
                 except Exception as e:
                     st.error(f"Error comparing units: {e}")
 
@@ -652,7 +661,7 @@ try:
             value_col=variable,
             title=f"{aggregation.title()} {variable} by {id_col}",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         # Spatial heatmap on map (if subbasins are loaded)
         if "subbasins_gdf" in st.session_state and output_type in ("rch", "sub", "sed"):

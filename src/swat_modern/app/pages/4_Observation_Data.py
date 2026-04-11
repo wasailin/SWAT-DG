@@ -1171,7 +1171,7 @@ if df is not None and not df.empty:
                     template="plotly_white",
                 )
                 fig.update_xaxes(rangeslider_visible=True)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
                 if sim_series is None:
                     st.caption("No simulation output found. Run SWAT first to compare observed vs simulated.")
@@ -1226,18 +1226,41 @@ if df is not None and not df.empty:
                         _sim_aligned = _sim_aligned.groupby(_sim_aligned.index).mean()
 
                     _freq_rank = {"daily": 0, "monthly": 1, "annual": 2, "unknown": -1}
-                    if _freq_rank.get(_obs_freq, -1) > _freq_rank.get(_sim_freq, -1):
-                        # Obs is coarser — aggregate sim to match
-                        if _obs_freq == "monthly":
-                            _sim_aligned = _sim_aligned.resample("ME").mean().dropna()
-                        elif _obs_freq == "annual":
-                            _sim_aligned = _sim_aligned.resample("YE").mean().dropna()
-                    elif _freq_rank.get(_sim_freq, -1) > _freq_rank.get(_obs_freq, -1):
-                        # Sim is coarser — aggregate obs to match
-                        if _sim_freq == "monthly":
-                            _obs_aligned = _obs_aligned.resample("ME").mean().dropna()
-                        elif _sim_freq == "annual":
-                            _obs_aligned = _obs_aligned.resample("YE").mean().dropna()
+                    _target_freq = max(_obs_freq, _sim_freq, key=lambda f: _freq_rank.get(f, -1))
+
+                    if _target_freq == "monthly" or (
+                        _obs_freq == "monthly" or _sim_freq == "monthly"
+                    ):
+                        # Aggregate both to year-month and merge by period
+                        # so that different day-of-month values (1st vs 31st)
+                        # still match within the same month.
+                        _obs_ym = _obs_aligned.groupby(
+                            _obs_aligned.index.to_period("M")
+                        ).mean()
+                        _sim_ym = _sim_aligned.groupby(
+                            _sim_aligned.index.to_period("M")
+                        ).mean()
+                        _common_periods = _obs_ym.index.intersection(_sim_ym.index)
+                        _obs_aligned = _obs_ym.loc[_common_periods]
+                        _sim_aligned = _sim_ym.loc[_common_periods]
+                        # Convert period index back to timestamp for display
+                        _obs_aligned.index = _common_periods.to_timestamp()
+                        _sim_aligned.index = _common_periods.to_timestamp()
+                    elif _target_freq == "annual":
+                        _obs_yr = _obs_aligned.groupby(
+                            _obs_aligned.index.year
+                        ).mean()
+                        _sim_yr = _sim_aligned.groupby(
+                            _sim_aligned.index.year
+                        ).mean()
+                        _common_yrs = _obs_yr.index.intersection(_sim_yr.index)
+                        _obs_aligned = _obs_yr.loc[_common_yrs]
+                        _sim_aligned = _sim_yr.loc[_common_yrs]
+                        _obs_aligned.index = pd.to_datetime(_common_yrs, format="%Y")
+                        _sim_aligned.index = pd.to_datetime(_common_yrs, format="%Y")
+                    else:
+                        # Daily or unknown: exact date match as before
+                        pass
 
                     # Find overlapping period
                     _common_idx = _obs_aligned.index.intersection(_sim_aligned.index)

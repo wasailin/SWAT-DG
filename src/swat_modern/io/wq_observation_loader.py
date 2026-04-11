@@ -229,13 +229,14 @@ class WQObservationLoader:
             One of ``"adeq"``, ``"obsfiles"``, ``"awrc"``, ``"generic"``.
         """
         try:
-            with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+            with open(filepath, "r", encoding="utf-8-sig", errors="replace") as fh:
                 header_line = fh.readline()
         except Exception as exc:
             logger.warning("Could not read header for format detection: %s", exc)
             return "generic"
 
-        header_lower = header_line.lower()
+        # Strip UTF-8 BOM (U+FEFF) that some files include
+        header_lower = header_line.lstrip("\ufeff").lower()
 
         # ADEQ: look for "datesampled" and "stationid"
         if "datesampled" in header_lower and "stationid" in header_lower:
@@ -278,7 +279,7 @@ class WQObservationLoader:
         # Read only the columns we need to avoid wasting memory on the
         # remaining ~270 columns.  First pass: get all column names.
         try:
-            all_cols = pd.read_csv(filepath, nrows=0, encoding="utf-8").columns.tolist()
+            all_cols = pd.read_csv(filepath, nrows=0, encoding="utf-8-sig").columns.tolist()
         except UnicodeDecodeError:
             all_cols = pd.read_csv(filepath, nrows=0, encoding="latin-1").columns.tolist()
 
@@ -301,7 +302,7 @@ class WQObservationLoader:
             raw = pd.read_csv(
                 filepath,
                 usecols=use_cols,
-                encoding="utf-8",
+                encoding="utf-8-sig",
                 low_memory=False,
             )
         except UnicodeDecodeError:
@@ -368,7 +369,7 @@ class WQObservationLoader:
           1 ton = 1000 kg, so 1 ton/m3 = 1000 kg/m3 = 1e6 mg/L).
         """
         try:
-            raw = pd.read_csv(filepath, encoding="utf-8", low_memory=False)
+            raw = pd.read_csv(filepath, encoding="utf-8-sig", low_memory=False)
         except UnicodeDecodeError:
             raw = pd.read_csv(filepath, encoding="latin-1", low_memory=False)
 
@@ -440,7 +441,7 @@ class WQObservationLoader:
         canonical column layout.
         """
         try:
-            raw = pd.read_csv(filepath, encoding="utf-8", low_memory=False)
+            raw = pd.read_csv(filepath, encoding="utf-8-sig", low_memory=False)
         except UnicodeDecodeError:
             raw = pd.read_csv(filepath, encoding="latin-1", low_memory=False)
 
@@ -557,7 +558,7 @@ class WQObservationLoader:
             columns whose names match canonical names exactly.
         """
         try:
-            raw = pd.read_csv(filepath, encoding="utf-8", low_memory=False)
+            raw = pd.read_csv(filepath, encoding="utf-8-sig", low_memory=False)
         except UnicodeDecodeError:
             raw = pd.read_csv(filepath, encoding="latin-1", low_memory=False)
 
@@ -833,7 +834,7 @@ def get_available_stations(
     candidates = station_col_candidates.get(format, ["StationID"])
 
     try:
-        header_df = pd.read_csv(filepath, nrows=0, encoding="utf-8")
+        header_df = pd.read_csv(filepath, nrows=0, encoding="utf-8-sig")
     except UnicodeDecodeError:
         header_df = pd.read_csv(filepath, nrows=0, encoding="latin-1")
 
@@ -857,7 +858,7 @@ def get_available_stations(
         col_data = pd.read_csv(
             filepath,
             usecols=[station_col],
-            encoding="utf-8",
+            encoding="utf-8-sig",
             low_memory=False,
         )
     except UnicodeDecodeError:

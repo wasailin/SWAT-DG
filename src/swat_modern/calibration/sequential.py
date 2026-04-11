@@ -316,6 +316,8 @@ class SequentialCalibrator:
         print_code: Optional[int] = None,
         custom_sim_period: Optional[tuple] = None,
         cancel_state=None,
+        cancel_file: Optional[str] = None,
+        progress_counter_dir: Optional[str] = None,
     ) -> SequentialCalibrationResult:
         """
         Run sequential upstream-to-downstream calibration.
@@ -457,10 +459,21 @@ class SequentialCalibrator:
                 setup_kwargs["custom_sim_period"] = custom_sim_period
             setup = SubbasinGroupSetup(**setup_kwargs)
 
-            # Attach cancel_state so simulation() can short-circuit
+            # Attach cancel_state so simulation() can short-circuit.
+            # Also attach the cross-process cancel_file so parallel SPOTPY
+            # workers — which can't share a threading.Event — detect
+            # cancellation on their next ``simulation()`` check.
             if cancel_state is not None:
                 setup._cancel_state = cancel_state
                 setup._cancel_event = getattr(cancel_state, "cancel_event", None)
+            if cancel_file is not None:
+                setup._cancel_file = cancel_file
+
+            # Wire file-based progress tracking so SPOTPY parallel workers
+            # (which lose the in-memory callback during pickling) can still
+            # report progress to the caller via per-PID counter files.
+            if progress_counter_dir is not None:
+                setup._progress_counter_dir = progress_counter_dir
 
             # Create and run SPOTPY sampler
             algorithm_classes = {
@@ -490,7 +503,8 @@ class SequentialCalibrator:
                     n_params = len(setup.parameter_set.names)
                     sampler.sample(n_iterations, ngs=n_params + 1)
                 elif algorithm == "dream":
-                    sampler.sample(n_iterations, nChains=4)
+                    # DREAM requires nChains >= 2*delta+1 (min 7 with default delta=3)
+                    sampler.sample(n_iterations, nChains=7)
                 else:
                     sampler.sample(n_iterations)
             except _CancelSignal:
@@ -716,6 +730,8 @@ class SequentialDiagnosticCalibrator:
         custom_sim_period: Optional[tuple] = None,
         run_progress_callback: Optional[Callable] = None,
         cancel_state=None,
+        cancel_file: Optional[str] = None,
+        print_code: Optional[int] = None,
     ) -> SequentialDiagnosticResult:
         """
         Run sequential diagnostic calibration.
@@ -830,6 +846,7 @@ class SequentialDiagnosticCalibrator:
                 cancel_state=cancel_state,
                 constituent=_detected_constituent,
                 partial_basin_reach=step.reach_id if self.use_partial_basin else None,
+                print_code=print_code,
             )
 
             if use_ensemble:
@@ -842,6 +859,8 @@ class SequentialDiagnosticCalibrator:
                     n_workers=n_ensemble_workers,
                     **diag_kwargs,
                 )
+                # EnsembleDiagnosticCalibrator manages its own cancel
+                # file internally and registers it on ``cancel_state``.
             else:
                 from swat_modern.calibration.diagnostic_calibrator import (
                     DiagnosticCalibrator,
@@ -851,6 +870,11 @@ class SequentialDiagnosticCalibrator:
                     observed_df=step.observed_data,
                     **diag_kwargs,
                 )
+                # Propagate cross-process cancel file so ``_check_cancel``
+                # sees the file-based flag (the in-memory ``_cancel_state``
+                # snapshot can't update across process boundaries).
+                if cancel_file is not None:
+                    calibrator._cancel_file = cancel_file
 
             result = calibrator.calibrate()
             total_runs += result.total_runs

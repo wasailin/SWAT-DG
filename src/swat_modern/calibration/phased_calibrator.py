@@ -232,6 +232,7 @@ class PhasedCalibrator:
         warmup_years: int = 1,
         progress_callback: Optional[Callable] = None,
         cancel_state=None,
+        cancel_file: Optional[str] = None,
         **kwargs,
     ):
         # Create working copy so locked params between phases don't
@@ -249,6 +250,15 @@ class PhasedCalibrator:
         self.warmup_years = warmup_years
         self.progress_callback = progress_callback
         self.cancel_state = cancel_state
+        # Cross-process cancel flag path for parallel SPOTPY workers.
+        # Propagated to every phase's inner setup so ``simulation()`` can
+        # short-circuit when the user clicks Cancel in the UI.
+        self.cancel_file = cancel_file
+        self.kge_target = kwargs.pop("kge_target", 0.70)
+        self.pbias_target = kwargs.pop("pbias_target", 10.0)
+        self.parallel = kwargs.pop("parallel", False)
+        self.n_cores = kwargs.pop("n_cores", None)
+        self.n_ensemble_workers = kwargs.pop("n_ensemble_workers", 4)
         self.kwargs = kwargs
 
         # Accumulated locked parameters (name -> value) from completed phases
@@ -434,6 +444,36 @@ class PhasedCalibrator:
                 self._report_phase_progress(idx, phase.name, "starting")
 
                 try:
+                    # Check WQ observation data availability before running
+                    if phase.name != "streamflow":
+                        obs_col = _PHASE_TO_OBS_COLUMN.get(phase.name)
+                        if (
+                            self.wq_observations is None
+                            or obs_col is None
+                            or obs_col not in self.wq_observations.columns
+                            or self.wq_observations[obs_col].notna().sum() == 0
+                        ):
+                            reason = (
+                                "no WQ observation data"
+                                if self.wq_observations is None
+                                else f"missing column '{obs_col}' in observation data"
+                            )
+                            print(f"\n  Skipping phase '{phase.name}': {reason}")
+                            phase_results.append({
+                                "name": phase.name,
+                                "parameters": {},
+                                "metrics": {},
+                                "result": None,
+                                "skipped": True,
+                                "error": None,
+                                "algorithm": phase.algorithm,
+                                "n_iterations": phase.n_iterations,
+                                "output_variable": phase.output_variable,
+                                "diagnostic_info": {},
+                            })
+                            self._report_phase_progress(idx, phase.name, "skipped")
+                            continue
+
                     diagnostic_info = {}
                     if phase.name == "streamflow":
                         cal_result = self._run_flow_phase(phase)
@@ -574,12 +614,21 @@ class PhasedCalibrator:
             calibrator._setup._cancel_event = getattr(
                 self.cancel_state, "cancel_event", None
             )
+        # Cross-process cancel flag — required for parallel SPOTPY
+        # workers (threading.Event does not cross process boundaries).
+        if self.cancel_file is not None:
+            calibrator._setup._cancel_file = self.cancel_file
 
         result = calibrator.auto_calibrate(
             n_iterations=phase.n_iterations,
             algorithm=phase.algorithm,
             verbose=True,
             progress_callback=inner_callback,
+            kge_target=self.kge_target,
+            pbias_target=self.pbias_target,
+            parallel=self.parallel,
+            n_cores=self.n_cores,
+            n_ensemble_workers=self.n_ensemble_workers,
         )
 
         return result
@@ -662,6 +711,9 @@ class PhasedCalibrator:
             setup._cancel_event = getattr(
                 self.cancel_state, "cancel_event", None
             )
+        # Cross-process cancel flag — required for parallel SPOTPY workers.
+        if self.cancel_file is not None:
+            setup._cancel_file = self.cancel_file
 
         # Inner progress callback
         inner_callback = self._make_inner_callback(phase.name)
@@ -690,12 +742,33 @@ class PhasedCalibrator:
 
         start_time = datetime.now()
 
+        # Determine parallel mode
+        parallel_mode = "seq"
+        if self.parallel:
+            try:
+                import multiprocessing as _mp
+                parallel_mode = "umpc"
+                if self.n_cores and self.n_cores > 0:
+                    _mp.cpu_count = lambda: self.n_cores
+                    try:
+                        import spotpy.parallel.mproc as _mproc
+                        _mproc.cpu_count = lambda: self.n_cores
+                    except ImportError:
+                        pass
+                logger.info(
+                    "WQ phase '%s': parallel mode=%s, cores=%s",
+                    phase.name, parallel_mode, self.n_cores or "auto",
+                )
+            except Exception as _pe:
+                logger.warning("Could not enable parallel for WQ phase: %s", _pe)
+                parallel_mode = "seq"
+
         try:
             sampler = AlgorithmClass(
                 setup,
                 dbname=dbname,
                 dbformat="ram",
-                parallel="seq",
+                parallel=parallel_mode,
             )
 
             if algorithm in ("sceua", "rope"):
@@ -704,7 +777,8 @@ class PhasedCalibrator:
                     ngs=len(phase.parameters) + 1,
                 )
             elif algorithm == "dream":
-                sampler.sample(phase.n_iterations, nChains=4)
+                # DREAM requires nChains >= 2*delta+1 (min 7 with default delta=3)
+                sampler.sample(phase.n_iterations, nChains=7)
             else:
                 sampler.sample(phase.n_iterations)
 
@@ -807,6 +881,11 @@ class PhasedCalibrator:
         partitioning, etc.) and adjusts parameters in 5-20 targeted SWAT
         runs rather than blind sampling.
 
+        When ``"diagnostic_ensemble"`` is selected (or ``"diagnostic"``
+        with ``self.parallel=True``), dispatches to
+        ``EnsembleDiagnosticCalibrator`` which runs N independent
+        calibrators in parallel with diverse starting configs.
+
         Args:
             phase: PhaseConfig for a WQ phase with a diagnostic algorithm.
 
@@ -842,28 +921,71 @@ class PhasedCalibrator:
         # (it will create its own backup from current model state)
         self._apply_locked_params_to_model(self._locked_params)
 
-        # Build extra kwargs
+        # Build extra kwargs shared by both single and ensemble calibrators
         extra = {}
-        for key in ("upstream_subbasins", "qswat_shapes_dir", "custom_sim_period"):
+        for key in ("upstream_subbasins", "qswat_shapes_dir", "custom_sim_period",
+                     "print_code"):
             if key in self.kwargs:
                 extra[key] = self.kwargs[key]
 
-        dc = DiagnosticCalibrator(
-            model=self.model,
-            observed_df=wq_obs_df,
-            parameter_names=phase.parameters,
-            reach_id=self.reach_id,
-            output_variable=phase.output_variable,
-            constituent=constituent,
-            max_iterations=phase.n_iterations,
-            warmup_years=self.warmup_years,
-            upstream_subbasins=extra.get("upstream_subbasins"),
-            qswat_shapes_dir=extra.get("qswat_shapes_dir"),
-            progress_callback=self._make_phase_progress_cb(phase),
-            cancel_state=self.cancel_state,
-            custom_sim_period=extra.get("custom_sim_period"),
-            _use_working_copy=False,  # PhasedCalibrator already has a working copy
+        # Decide whether to use ensemble (parallel multi-start) mode.
+        # Ensemble is used when: algorithm is "diagnostic_ensemble", OR
+        # algorithm is "diagnostic" with parallel=True.
+        use_ensemble = (
+            phase.algorithm == "diagnostic_ensemble"
+            or (phase.algorithm == "diagnostic" and self.parallel)
         )
+
+        if use_ensemble:
+            from swat_modern.calibration.diagnostic_calibrator import (
+                EnsembleDiagnosticCalibrator,
+            )
+            n_workers = self.n_ensemble_workers or self.n_cores or 4
+
+            logger.info(
+                "WQ diagnostic ensemble for phase '%s': %d workers",
+                phase.name, n_workers,
+            )
+
+            dc = EnsembleDiagnosticCalibrator(
+                model=self.model,
+                observed_df=wq_obs_df,
+                n_workers=n_workers,
+                parameter_names=phase.parameters,
+                reach_id=self.reach_id,
+                output_variable=phase.output_variable,
+                constituent=constituent,
+                max_iterations=phase.n_iterations,
+                warmup_years=self.warmup_years,
+                kge_target=self.kge_target,
+                pbias_target=self.pbias_target,
+                upstream_subbasins=extra.get("upstream_subbasins"),
+                qswat_shapes_dir=extra.get("qswat_shapes_dir"),
+                progress_callback=self._make_phase_progress_cb(phase),
+                cancel_state=self.cancel_state,
+                custom_sim_period=extra.get("custom_sim_period"),
+                print_code=extra.get("print_code"),
+            )
+        else:
+            dc = DiagnosticCalibrator(
+                model=self.model,
+                observed_df=wq_obs_df,
+                parameter_names=phase.parameters,
+                reach_id=self.reach_id,
+                output_variable=phase.output_variable,
+                constituent=constituent,
+                max_iterations=phase.n_iterations,
+                warmup_years=self.warmup_years,
+                kge_target=self.kge_target,
+                pbias_target=self.pbias_target,
+                upstream_subbasins=extra.get("upstream_subbasins"),
+                qswat_shapes_dir=extra.get("qswat_shapes_dir"),
+                progress_callback=self._make_phase_progress_cb(phase),
+                cancel_state=self.cancel_state,
+                custom_sim_period=extra.get("custom_sim_period"),
+                print_code=extra.get("print_code"),
+                _use_working_copy=False,  # PhasedCalibrator already has a working copy
+            )
 
         diag_result = dc.calibrate()
         cal_result = diag_result.to_calibration_result()
@@ -873,21 +995,34 @@ class PhasedCalibrator:
         """Prepare a DataFrame with 'date' and 'observed' columns for a WQ phase.
 
         DiagnosticCalibrator expects the same format as flow observations:
-        a DataFrame with 'date' and 'observed' columns.  This method
-        extracts the relevant WQ column and renames it.
+        a DataFrame with 'date' and 'observed' columns.  The observed values
+        must be in the same units as the SWAT output variable (loads: kg/day
+        for N/P, tons/day for sediment).
+
+        WQ observations from ``WQObservationLoader`` are concentrations
+        (mg/L).  This method converts them to loads by pairing with
+        streamflow data (observed flow where available, otherwise a
+        baseline SWAT simulation).
 
         Args:
             phase: PhaseConfig for the WQ phase.
 
         Returns:
-            DataFrame with 'date' and 'observed' columns, or None if
-            the required observation column is missing.
+            DataFrame with 'date' and 'observed' columns (loads in
+            SWAT-compatible units), or None if the required observation
+            column is missing.
         """
+        from swat_modern.io.unit_converter import convert_obs_to_load
+
         obs_col = _PHASE_TO_OBS_COLUMN.get(phase.name)
         if obs_col is None or obs_col not in self.wq_observations.columns:
             return None
 
-        # Find the date column
+        constituent = _PHASE_TO_CONSTITUENT.get(phase.name)
+        if constituent is None:
+            return None
+
+        # Find the date column in wq_observations
         date_col = None
         for c in self.wq_observations.columns:
             if c.lower() in ("date", "datetime"):
@@ -897,10 +1032,14 @@ class PhasedCalibrator:
             date_col = self.wq_observations.columns[0]
 
         df = self.wq_observations[[date_col, obs_col]].copy()
-        df = df.rename(columns={date_col: "date", obs_col: "observed"})
-        df = df.dropna(subset=["observed"])
+        df = df.rename(columns={date_col: "date"})
+        df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+        df = df.dropna(subset=[obs_col])
 
-        # Optionally include flow column for process diagnostics
+        # --- Build a flow time series for concentration → load conversion ---
+        # Priority: observed flow > baseline SWAT simulation
+        flow_series = None
+
         if self.flow_observations is not None and isinstance(self.flow_observations, pd.DataFrame):
             flow_date_col = None
             for c in self.flow_observations.columns:
@@ -912,10 +1051,115 @@ class PhasedCalibrator:
 
             if "observed" in self.flow_observations.columns:
                 flow_df = self.flow_observations[[flow_date_col, "observed"]].copy()
-                flow_df = flow_df.rename(columns={flow_date_col: "date", "observed": "flow"})
-                flow_df["date"] = pd.to_datetime(flow_df["date"])
-                df["date"] = pd.to_datetime(df["date"])
+                flow_df = flow_df.rename(columns={flow_date_col: "date", "observed": "flow_cms"})
+                flow_df["date"] = pd.to_datetime(flow_df["date"]).dt.normalize()
                 df = pd.merge(df, flow_df, on="date", how="left")
+                flow_series = df["flow_cms"]
+
+        # If no observed flow (or too many gaps), run a baseline SWAT
+        # simulation with locked hydrology params to get simulated flow.
+        if flow_series is None or flow_series.notna().sum() < 5:
+            logger.info(
+                "Running baseline SWAT simulation to obtain flow "
+                "for WQ observation load conversion (phase '%s')...",
+                phase.name,
+            )
+            # Back up output files — model.run() deletes them, and if SWAT
+            # fails the working copy's output needed by later phases is lost.
+            import shutil
+            _WQ_OUTPUT_NAMES = (
+                "output.rch", "output.sub", "output.hru",
+                "output.rsv", "output.sed", "output.std",
+            )
+            _wq_output_backups = {}
+            for _fname in _WQ_OUTPUT_NAMES:
+                _src = self.model.project_dir / _fname
+                if _src.exists():
+                    _bak = _src.with_suffix(_src.suffix + ".bak_wq")
+                    shutil.copy2(_src, _bak)
+                    _wq_output_backups[_fname] = _bak
+
+            try:
+                self._apply_locked_params_to_model(self._locked_params)
+                from swat_modern.calibration.spotpy_setup import run_baseline_simulation
+                # Use a dummy observed_df just to get the full simulated time series
+                dummy_obs = pd.DataFrame({
+                    "date": df["date"],
+                    "observed": np.zeros(len(df)),
+                })
+                baseline = run_baseline_simulation(
+                    model=self.model,
+                    observed_df=dummy_obs,
+                    output_variable="FLOW_OUT",
+                    reach_id=self.reach_id,
+                    warmup_years=self.warmup_years,
+                    upstream_subbasins=self.kwargs.get("upstream_subbasins"),
+                    qswat_shapes_dir=self.kwargs.get("qswat_shapes_dir"),
+                    print_code=self.kwargs.get("print_code"),
+                )
+                if baseline["success"] and baseline["simulated"] is not None:
+                    sim_flow_df = pd.DataFrame({
+                        "date": pd.to_datetime(baseline["dates"]),
+                        "flow_cms": baseline["simulated"],
+                    })
+                    sim_flow_df["date"] = sim_flow_df["date"].dt.normalize()
+                    df = df.drop(columns=["flow_cms"], errors="ignore")
+                    df = pd.merge(df, sim_flow_df, on="date", how="left")
+                    flow_series = df["flow_cms"]
+                    logger.info(
+                        "Baseline flow obtained: %d/%d WQ dates matched.",
+                        flow_series.notna().sum(), len(df),
+                    )
+                else:
+                    logger.warning(
+                        "Baseline simulation failed for flow extraction; "
+                        "WQ observations will remain as concentrations."
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Could not run baseline for flow: %s; "
+                    "WQ observations will remain as concentrations.",
+                    e,
+                )
+            finally:
+                # Restore output files so later phases find them intact.
+                for _fname, _bak in _wq_output_backups.items():
+                    _dst = self.model.project_dir / _fname
+                    if _bak.exists():
+                        shutil.copy2(_bak, _dst)
+                        _bak.unlink()
+
+        # --- Convert concentration to load ---
+        if "flow_cms" in df.columns and df["flow_cms"].notna().any():
+            concentration = df[obs_col].values
+            flow_vals = df["flow_cms"].values
+            loads = convert_obs_to_load(constituent, concentration, flow_vals)
+            df["observed"] = loads
+            df = df.dropna(subset=["observed"])
+            logger.info(
+                "Converted %d %s observations from concentration (mg/L) "
+                "to load (%s).",
+                len(df), phase.name,
+                "tons/day" if constituent == "TSS" else "kg/day",
+            )
+        else:
+            # Fallback: pass concentrations (will be unit-mismatched but
+            # avoids a hard failure).  Log a clear warning.
+            logger.warning(
+                "No flow data available for phase '%s'; passing raw "
+                "concentrations (mg/L) as observations.  Calibration "
+                "metrics will be unreliable!",
+                phase.name,
+            )
+            df["observed"] = df[obs_col]
+            df = df.dropna(subset=["observed"])
+
+        # Keep only date, observed, and optionally flow for process diagnostics
+        keep_cols = ["date", "observed"]
+        if "flow_cms" in df.columns:
+            df = df.rename(columns={"flow_cms": "flow"})
+            keep_cols.append("flow")
+        df = df[keep_cols].reset_index(drop=True)
 
         return df
 

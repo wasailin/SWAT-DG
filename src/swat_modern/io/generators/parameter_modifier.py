@@ -103,11 +103,40 @@ PARAMETER_LOCATIONS = {
     "BIOMIX": ("mgt", 9),
     "FILTERW": ("mgt", 10),
 
-    # Basin sediment routing parameters (.bsn)
+    # Sediment routing parameters.
+    # ADJ_PKR is a true basin-wide scalar (readbsn.f:410 reads adj_pkr
+    # directly, used in readwgn.f for precipitation peak adjustment).
+    # PRF / SPCON / SPEXP are per-reach arrays read from .rte files
+    # (readrte.f:135-139); the basin-wide *_bsn values are only fallbacks
+    # when the per-reach value <= 0 (readrte.f:155-157).  rtsed.f uses
+    # prf(jrch), spcon(jrch), spexp(jrch) for channel sediment routing,
+    # so these must be modified in .rte files, not basins.bsn.
     "ADJ_PKR": ("bsn", 16),
-    "PRF": ("bsn", 17),
-    "SPCON": ("bsn", 18),
-    "SPEXP": ("bsn", 19),
+    "PRF": ("rte", 26),
+    "SPCON": ("rte", 27),
+    "SPEXP": ("rte", 28),
+
+    # Soil layer parameters (.sol) — handled by pipe format (SOL_AWC1,
+    # SOL_AWC2, …) or old tabular format fallback.
+    "SOL_AWC": ("sol", None),
+    "SOL_K": ("sol", None),
+    "SOL_BD": ("sol", None),
+    "SOL_CBN": ("sol", None),
+    "SOL_Z": ("sol", None),
+    "USLE_K": ("sol", None),
+}
+
+
+# Mapping from soil-layer parameter names to their descriptive labels in
+# the old ArcSWAT/QSWAT tabular .sol format (no pipe delimiters).
+# Each line contains space-separated values for all layers after a colon.
+_SOL_OLD_FORMAT_LABELS = {
+    "SOL_AWC": "Ave. AW Incl. Rock Frag",
+    "SOL_K": "Ksat.",
+    "SOL_BD": "Bulk Density Moist",
+    "SOL_CBN": "Organic Carbon",
+    "SOL_Z": "Depth",
+    "USLE_K": "Erosion K",
 }
 
 
@@ -235,6 +264,25 @@ class ParameterModifier:
             else:
                 new_lines.append(line)
 
+        # Fallback: old ArcSWAT/QSWAT tabular .sol format (no pipe delimiters).
+        # Lines look like: " Ave. AW Incl. Rock Frag  :  0.23  0.19  0.02  0.06"
+        # with multiple layer values on one line after a descriptive label.
+        if not found:
+            old_label = _SOL_OLD_FORMAT_LABELS.get(param_name)
+            if old_label:
+                new_lines = []
+                for line in lines:
+                    if old_label.lower() in line.lower():
+                        found = True
+                        new_line = self._modify_tabular_line(
+                            line, value, method, decimal_precision,
+                        )
+                        if new_line != line:
+                            modified = True
+                        new_lines.append(new_line)
+                    else:
+                        new_lines.append(line)
+
         if modified:
             with open(file_path, 'w', errors='surrogateescape') as f:
                 f.writelines(new_lines)
@@ -301,6 +349,57 @@ class ParameterModifier:
             new_value_str = f"{new_value:16.{decimal_precision}f}"
 
         return new_value_str + "    |" + "|".join(parts[1:])
+
+    @staticmethod
+    def _modify_tabular_line(
+        line: str,
+        value: float,
+        method: str,
+        decimal_precision: int = 4,
+    ) -> str:
+        """Modify all numeric values in an old-format .sol tabular line.
+
+        Old ArcSWAT/QSWAT .sol lines have a descriptive label, a colon,
+        then space-separated values for each soil layer, e.g.::
+
+            Ave. AW Incl. Rock Frag  :        0.23        0.19        0.02
+
+        All layer values are modified uniformly with the same method/value.
+        """
+        if ":" not in line:
+            return line
+
+        label_part, values_part = line.split(":", 1)
+        # Parse numeric tokens, preserving their positions
+        tokens = re.split(r"(\s+)", values_part)
+        new_tokens = []
+        for token in tokens:
+            stripped = token.strip()
+            if not stripped:
+                new_tokens.append(token)
+                continue
+            try:
+                current = float(stripped)
+            except ValueError:
+                new_tokens.append(token)
+                continue
+
+            if method == "replace":
+                new_val = value
+            elif method == "multiply":
+                new_val = current * (1 + value)
+            elif method == "add":
+                new_val = current + value
+            else:
+                new_tokens.append(token)
+                continue
+
+            # Keep the same field width as the original token
+            field_width = len(token)
+            formatted = f"{new_val:.{decimal_precision}f}"
+            new_tokens.append(formatted.rjust(field_width))
+
+        return label_part + ":" + "".join(new_tokens)
 
     def get_parameter(
         self,

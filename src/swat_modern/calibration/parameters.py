@@ -513,7 +513,11 @@ CALIBRATION_PARAMETERS: Dict[str, CalibrationParameter] = {
     ),
     "SPCON": CalibrationParameter(
         name="SPCON",
-        file_type="bsn",
+        # Read per-reach from .rte files; SWAT ignores the basin-wide
+        # spcon_bsn from basins.bsn whenever the per-reach value > 0
+        # (readrte.f:156).  Modifying basins.bsn has no effect on rtsed.f,
+        # which uses spcon(jrch) directly.
+        file_type="rte",
         min_value=0.0001,
         max_value=0.01,
         default_value=0.001,
@@ -524,7 +528,8 @@ CALIBRATION_PARAMETERS: Dict[str, CalibrationParameter] = {
     ),
     "SPEXP": CalibrationParameter(
         name="SPEXP",
-        file_type="bsn",
+        # Read per-reach from .rte files (see SPCON comment).
+        file_type="rte",
         min_value=1.0,
         max_value=2.0,
         default_value=1.0,
@@ -569,7 +574,11 @@ CALIBRATION_PARAMETERS: Dict[str, CalibrationParameter] = {
     ),
     "PRF": CalibrationParameter(
         name="PRF",
-        file_type="bsn",
+        # Read per-reach from .rte files; the basins.bsn PRF_BSN value is
+        # only used as a fallback when the per-reach prf <= 0
+        # (readrte.f:155). rtsed.f uses prf(jrch) for peakr calculation,
+        # so modifying basins.bsn has no effect on sediment routing.
+        file_type="rte",
         min_value=0.0,
         max_value=2.0,
         default_value=1.0,

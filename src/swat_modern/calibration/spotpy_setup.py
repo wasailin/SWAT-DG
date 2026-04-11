@@ -73,28 +73,60 @@ def _check_cancel_setup(setup) -> None:
 def _add_date_column(output: pd.DataFrame, model) -> pd.DataFrame:
     """Build a ``date`` column on a SWAT output DataFrame.
 
-    Handles three SWAT output formats:
-    1. Daily with DAY + YEAR columns: MON=month, DAY=day-of-month, YEAR=year
-    2. Daily without DAY/YEAR: MON=day-of-year (1–365), year derived from
-       the simulation period.
-    3. Monthly: MON=month (1–12), row with MON=13 is the annual summary
-       and is dropped.
+    Handles all three SWAT output.rch formats (IPRINT in file.cio):
+    - **IPRINT=0 monthly**: rchmon writes MON=1..12 data rows; rchyr is
+      still called and appends per-reach yearly summary rows with
+      MON=iyr (e.g., 2005..2020); rchaa appends a final avg-annual row
+      with MON=years (e.g., 16.0). All summary rows must be stripped.
+    - **IPRINT=1 daily**: rchday writes MON=1..366 (day-of-year); no
+      yearly or avg-annual rows are written (writea skips the annual
+      section when iprint==1).
+    - **IPRINT=2 yearly**: rchyr writes MON=iyr (year, e.g., 2005..2020);
+      rchaa appends the final avg-annual row with MON=years (e.g., 16.0),
+      which must be stripped to leave only the real yearly data rows.
 
-    The format is auto-detected from the MON value range.
+    The format is selected from ``model.config.output.print_code``
+    (IPRINT) rather than by heuristics on MON values, which fail when
+    summary rows have MON values that look like data values.
     """
     output = output.copy()
 
     if "MON" not in output.columns:
         raise ValueError("Cannot determine output time step — no MON column")
 
-    # Rev 692+ writes annual-summary rows with MON = year (e.g. 2017)
-    # instead of MON = 13.  When a mix of small (1–366) and large (>366)
-    # values exists the large ones are annual summaries and must be
-    # dropped before auto-detecting the output format.  If ALL values
-    # are large this is yearly output (IPRINT=2) and they are kept.
-    _year_like = output["MON"] > 366
-    if _year_like.any() and not _year_like.all():
-        output = output[~_year_like].copy()
+    # Use IPRINT from file.cio to determine output format reliably.
+    # IPRINT: 0=monthly, 1=daily, 2=yearly.
+    _print_code = model.config.output.print_code
+    start_year = model.config.period.start_year
+    nyskip = model.config.period.warmup_years
+
+    # Strip summary rows based on IPRINT before processing.
+    if _print_code == 0:
+        # Monthly: keep only MON in [1, 12].  This removes both the
+        # yearly summary rows (MON=iyr, e.g. 2005..2020) and the final
+        # avg-annual row (MON=years, e.g. 16.0).
+        output = output[output["MON"] <= 12].copy()
+    elif _print_code == 2:
+        # Yearly: real data rows have MON=iyr (a plausible calendar year,
+        # e.g. 2005..2020). The final avg-annual row has MON=years (a
+        # small float equal to the number of simulated years, e.g. 16.0).
+        # Keep only rows whose MON looks like a calendar year >= start.
+        output = output[output["MON"] >= start_year].copy()
+    else:
+        # Daily (IPRINT=1): writea skips the annual section when
+        # iprint==1, so there are no summary rows to strip. Fall back to
+        # a defensive "strip year-like values" only if a mix is present
+        # (covers unusual builds that still emit summary rows).
+        _year_like = output["MON"] > 366
+        if _year_like.any() and not _year_like.all():
+            output = output[~_year_like].copy()
+
+    if len(output) == 0:
+        raise ValueError(
+            f"No data rows remain after stripping summary rows "
+            f"(IPRINT={_print_code}). Check that output.rch has the "
+            f"expected format for this IPRINT setting."
+        )
 
     mon_max = int(output["MON"].max())
 
@@ -108,11 +140,14 @@ def _add_date_column(output: pd.DataFrame, model) -> pd.DataFrame:
             )
         )
 
-    # --- Case 2: MON > 13 → daily output, MON = day-of-year (1–365/366) ---
-    elif mon_max > 13:
-        start_year = model.config.period.start_year
-        nyskip = model.config.period.warmup_years
+    # --- Case 2a: IPRINT=2 → yearly output, MON = calendar year ---
+    elif _print_code == 2:
+        output["date"] = pd.to_datetime(
+            output["MON"].astype(int).astype(str) + "-01-01"
+        )
 
+    # --- Case 2b: IPRINT=1 or MON > 13 → daily output, MON = day-of-year ---
+    elif _print_code == 1 or mon_max > 13:
         # Derive year from the day-of-year wrapping pattern
         years = []
         current_year = start_year + nyskip
@@ -127,11 +162,8 @@ def _add_date_column(output: pd.DataFrame, model) -> pd.DataFrame:
             [f"{y}-01-01" for y in years]
         ) + pd.to_timedelta([int(d) - 1 for d in output["MON"].values], unit="D")
 
-    # --- Case 3: MON ≤ 13 → monthly output, MON = month (1–12) ---
+    # --- Case 3: IPRINT=0 or MON ≤ 13 → monthly output, MON = month (1–12) ---
     else:
-        # Drop annual-summary row (MON = 13)
-        output = output[output["MON"] <= 12]
-
         if "YEAR" in output.columns:
             output["date"] = pd.to_datetime(
                 output["YEAR"].astype(str) + "-" +
@@ -139,9 +171,8 @@ def _add_date_column(output: pd.DataFrame, model) -> pd.DataFrame:
             )
         else:
             # Derive year from the month wrapping pattern
-            start_year = model.config.period.start_year
             years = []
-            current_year = start_year
+            current_year = start_year + nyskip
             prev_mon = 0
             for mon in output["MON"].values:
                 if mon < prev_mon:
@@ -153,6 +184,128 @@ def _add_date_column(output: pd.DataFrame, model) -> pd.DataFrame:
             )
 
     return output
+
+
+def _print_code_to_timestep(print_code: Optional[int]) -> str:
+    """Map SWAT IPRINT value to timestep label.
+
+    IPRINT: 1=daily, 0=monthly, 2=yearly (SWAT convention).
+    Returns 'daily' when print_code is None (default).
+    """
+    if print_code is None:
+        return "daily"
+    return {1: "daily", 0: "monthly", 2: "yearly"}.get(print_code, "daily")
+
+
+def _is_mass_variable(var_name: str) -> bool:
+    """Return True if the SWAT variable is a mass/cumulative quantity.
+
+    SWAT monthly/yearly output reports mass variables (kg, tons) as
+    period *totals* (summed over all days), while rate variables (cms,
+    m3/s) are period *averages*.  Observed loads from LoadCalculator are
+    in daily rates (kg/day, tons/day).  To compare, mass totals must be
+    divided by the number of days in the period.
+    """
+    vl = var_name.lower()
+    # Match common SWAT mass variable suffixes
+    return vl.endswith("kg") or vl.endswith("tons") or vl.endswith("ton")
+
+
+def _merge_sim_obs(
+    output: pd.DataFrame,
+    obs_df: pd.DataFrame,
+    var_col: str,
+    obs_col: str = "observed",
+    date_col: str = "date",
+    timestep: str = "daily",
+    log: bool = True,
+) -> pd.DataFrame:
+    """Merge simulated and observed data according to timestep.
+
+    For daily: exact date match.
+    For monthly: group both sim and obs by year-month, average multiple
+        observations in the same month, then merge.
+    For yearly: group both sim and obs by year, average multiple
+        observations in the same year, then merge.
+
+    For mass variables (kg, tons) with monthly/yearly timesteps, SWAT
+    output is a period total while observed loads are daily rates.  The
+    simulated values are divided by the number of days in the period so
+    both sides are in daily-average units.
+
+    Returns:
+        DataFrame with columns: date, <var_col>, <obs_col>
+    """
+    _mass_var = _is_mass_variable(var_col) and timestep != "daily"
+
+    if timestep == "daily":
+        merged = pd.merge(
+            obs_df[[date_col, obs_col]].rename(columns={date_col: "date"}),
+            output[["date", var_col]],
+            on="date",
+            how="left",
+        )
+    elif timestep == "monthly":
+        # Average observations within each year-month
+        obs_tmp = obs_df[[date_col, obs_col]].copy()
+        obs_tmp["_ym"] = pd.to_datetime(obs_tmp[date_col]).dt.to_period("M")
+        obs_agg = obs_tmp.groupby("_ym")[obs_col].mean().reset_index()
+
+        # Take mean of sim within each year-month (handles daily output)
+        out_tmp = output[["date", var_col]].copy()
+        out_tmp["_ym"] = out_tmp["date"].dt.to_period("M")
+        out_agg = out_tmp.groupby("_ym")[var_col].mean().reset_index()
+
+        # For mass variables, SWAT monthly output = total for the month.
+        # Divide by days-in-month to get a daily-average rate comparable
+        # to observed loads (kg/day or tons/day).
+        if _mass_var:
+            out_agg["_days"] = out_agg["_ym"].apply(lambda p: p.days_in_month)
+            out_agg[var_col] = out_agg[var_col] / out_agg["_days"]
+            out_agg = out_agg.drop(columns="_days")
+
+        merged = pd.merge(obs_agg, out_agg, on="_ym", how="left")
+        # Reconstruct a date column (1st of month) for reference
+        merged["date"] = merged["_ym"].dt.to_timestamp()
+        merged = merged.drop(columns="_ym")
+
+        if log:
+            n_valid = int(np.sum(~np.isnan(merged[var_col].values.astype(float))))
+            _extra = " (sim / days-in-month = daily avg)" if _mass_var else ""
+            print(
+                f"[merge] Monthly merge: {len(merged)} months, "
+                f"{n_valid} with sim data{_extra}"
+            )
+    else:  # yearly
+        # Average observations within each year
+        obs_tmp = obs_df[[date_col, obs_col]].copy()
+        obs_tmp["_yr"] = pd.to_datetime(obs_tmp[date_col]).dt.year
+        obs_agg = obs_tmp.groupby("_yr")[obs_col].mean().reset_index()
+
+        # Take mean of sim within each year
+        out_tmp = output[["date", var_col]].copy()
+        out_tmp["_yr"] = out_tmp["date"].dt.year
+        out_agg = out_tmp.groupby("_yr")[var_col].mean().reset_index()
+
+        # For mass variables, SWAT yearly output = total for the year.
+        # Divide by 365 (approximate) to get daily-average rate.
+        if _mass_var:
+            out_agg[var_col] = out_agg[var_col] / 365.25
+
+        merged = pd.merge(obs_agg, out_agg, on="_yr", how="left")
+        # Reconstruct a date column (Jan 1) for reference
+        merged["date"] = pd.to_datetime(merged["_yr"], format="%Y")
+        merged = merged.drop(columns="_yr")
+
+        if log:
+            n_valid = int(np.sum(~np.isnan(merged[var_col].values.astype(float))))
+            _extra = " (sim / 365 = daily avg)" if _mass_var else ""
+            print(
+                f"[merge] Yearly merge: {len(merged)} years, "
+                f"{n_valid} with sim data{_extra}"
+            )
+
+    return merged
 
 
 def run_baseline_simulation(
@@ -358,59 +511,39 @@ def run_baseline_simulation(
 
         obs[date_col] = pd.to_datetime(obs[date_col]).dt.normalize()
 
-        # Merge
-        merged = pd.merge(
-            obs[[date_col, "observed"]].rename(columns={date_col: "date"}),
-            output[["date", var_col]],
-            on="date",
-            how="left",
+        # Merge according to user-selected calibration timestep
+        timestep = _print_code_to_timestep(print_code)
+        print(f"[baseline] Calibration timestep: {timestep}")
+
+        merged = _merge_sim_obs(
+            output, obs, var_col,
+            obs_col="observed", date_col=date_col,
+            timestep=timestep, log=True,
         )
 
         simulated = merged[var_col].values
         observed_vals = merged["observed"].values
         dates = merged["date"].values
 
-        # Year-month fallback if most values are NaN
+        # Log match rate for sparse observations (WQ/sediment)
         nan_rate = np.isnan(simulated.astype(float)).mean()
-        if nan_rate > 0.5 and len(output) > 0:
+        if nan_rate > 0.3 and len(output) > 0:
+            n_valid = int(np.sum(~np.isnan(simulated.astype(float))))
             print(
-                f"WARNING: High NaN rate ({nan_rate*100:.0f}%) in baseline date merge. "
-                f"Sim dates: {output['date'].min()} to {output['date'].max()}, "
-                f"Obs dates: {obs[date_col].min()} to {obs[date_col].max()}. "
-                f"Attempting year-month fallback..."
+                f"INFO: {nan_rate*100:.0f}% of obs have no matching sim "
+                f"({n_valid}/{len(simulated)} valid pairs). "
+                f"Sim: {output['date'].min()} to {output['date'].max()}, "
+                f"Obs: {obs[date_col].min()} to {obs[date_col].max()}. "
+                f"Calibrating on matched {timestep} periods only."
             )
-            obs_norm = obs[[date_col, "observed"]].rename(columns={date_col: "date"})
-            obs_ym = obs_norm["date"].dt.to_period("M")
-            out_ym = output["date"].dt.to_period("M")
-
-            obs_tmp = obs_norm.copy()
-            obs_tmp["_ym"] = obs_ym
-            out_tmp = output[["date", var_col]].copy()
-            out_tmp["_ym"] = out_ym
-            out_tmp = out_tmp.drop_duplicates(subset="_ym", keep="first")
-
-            merged_ym = pd.merge(
-                obs_tmp[["_ym"]].reset_index(),
-                out_tmp[["_ym", var_col]],
-                on="_ym",
-                how="left",
-            ).sort_values("index").reset_index(drop=True)
-
-            simulated_ym = merged_ym[var_col].values
-            new_nan_rate = np.isnan(simulated_ym.astype(float)).mean()
-            if new_nan_rate < nan_rate:
-                print(
-                    f"WARNING: Using year-month merge for baseline. "
-                    f"NaN rate: {nan_rate*100:.1f}% -> {new_nan_rate*100:.1f}%"
-                )
-                simulated = simulated_ym
 
         result["simulated"] = np.asarray(simulated, dtype=float)
+        result["observed"] = np.asarray(observed_vals, dtype=float)
         result["dates"] = dates
 
         # Calculate metrics (only on dates where both sim and obs exist)
         sim_f = result["simulated"]
-        obs_f = np.asarray(observed_vals, dtype=float)
+        obs_f = result["observed"]
         mask = ~(np.isnan(obs_f) | np.isnan(sim_f))
         n_valid = int(np.sum(mask))
         result["n_valid_pairs"] = n_valid
@@ -591,6 +724,7 @@ class SWATModelSetup:
         self.observed_df = self._load_observed_data(
             observed_data, date_column, value_column
         )
+        self._aggregated_obs = None  # set by simulation() for monthly/yearly
 
         # Set up objective function
         self.objective_func = ObjectiveFunction(objective)
@@ -1253,7 +1387,22 @@ class SWATModelSetup:
 
         # Ensure date column is datetime
         if date_column not in data.columns:
-            raise ValueError(f"Date column '{date_column}' not found in data")
+            # Try case-insensitive match or auto-detect
+            col_lower = {c.lower().strip(): c for c in data.columns}
+            if date_column.lower() in col_lower:
+                _actual = col_lower[date_column.lower()]
+                data = data.rename(columns={_actual: date_column})
+            else:
+                # Last resort: look for any date-like column
+                from swat_modern.io.observation_loader import ObservationLoader
+                _detected = ObservationLoader.detect_date_column(data)
+                if _detected and _detected in data.columns:
+                    data = data.rename(columns={_detected: date_column})
+                else:
+                    raise ValueError(
+                        f"Date column '{date_column}' not found in data. "
+                        f"Available columns: {list(data.columns)}"
+                    )
 
         if not pd.api.types.is_datetime64_any_dtype(data[date_column]):
             data[date_column] = pd.to_datetime(data[date_column])
@@ -1466,71 +1615,44 @@ class SWATModelSetup:
             warmup_end = min_date + pd.DateOffset(years=self.warmup_years)
             output = output[output["date"] >= warmup_end]
 
+        # Merge according to user-selected calibration timestep
+        timestep = _print_code_to_timestep(self._print_code)
+
         # Log SWAT output info on first simulation only
         if self._simulation_count <= 1:
             out_dates = output["date"].sort_values()
-            if len(out_dates) > 2:
-                _median_dt = out_dates.diff().dt.days.median()
-                _ts_label = "daily" if _median_dt < 5 else "monthly" if _median_dt < 40 else "yearly"
-            else:
-                _median_dt = 0
-                _ts_label = "unknown"
+            _median_dt = out_dates.diff().dt.days.median() if len(out_dates) > 2 else 0
             print(
                 f"[sim-output] {len(output)} rows, var='{var_col}', "
-                f"timestep={_ts_label} (median {_median_dt:.0f} days), "
+                f"timestep={timestep} (median {_median_dt:.0f} days), "
                 f"dates: {out_dates.iloc[0]} to {out_dates.iloc[-1]}, "
                 f"IPRINT={self.model.config.output.print_code}"
             )
 
-        # Merge with observed data
-        merged = pd.merge(
-            self.observed_df,
-            output[["date", var_col]],
-            on="date",
-            how="left",
+        # Merge sim/obs by detected timestep.
+        # For monthly/yearly, multiple obs in the same period are averaged.
+        merged = _merge_sim_obs(
+            output, self.observed_df, var_col,
+            obs_col="observed", date_col="date",
+            timestep=timestep, log=(self._simulation_count <= 1),
         )
 
-        # Return simulated values (NaN where no match)
         simulated = merged[var_col].values
 
-        # If most values are NaN, try year-month merge (handles monthly
-        # SWAT output aligned against daily observed data).
+        # For monthly/yearly merges, evaluation() must return the
+        # aggregated observed values (not the original daily obs).
+        if timestep != "daily":
+            self._aggregated_obs = merged["observed"].values
+
+        # Log match rate on first sim
         nan_rate = np.isnan(simulated).mean()
-        if nan_rate > 0.5 and len(output) > 0:
-            if self._simulation_count <= 1:
-                print(
-                    f"WARNING: High NaN rate ({nan_rate*100:.0f}%) after date merge. "
-                    f"Sim dates: {output['date'].min()} to {output['date'].max()}, "
-                    f"Obs dates: {self.observed_df['date'].min()} to "
-                    f"{self.observed_df['date'].max()}. "
-                    f"Attempting year-month fallback..."
-                )
-
-            obs_ym = self.observed_df["date"].dt.to_period("M")
-            out_ym = output["date"].dt.to_period("M")
-
-            obs_tmp = self.observed_df.copy()
-            obs_tmp["_ym"] = obs_ym
-            out_tmp = output[["date", var_col]].copy()
-            out_tmp["_ym"] = out_ym
-            out_tmp = out_tmp.drop_duplicates(subset="_ym", keep="first")
-
-            merged_ym = pd.merge(
-                obs_tmp[["_ym"]].reset_index(),
-                out_tmp[["_ym", var_col]],
-                on="_ym",
-                how="left",
-            ).sort_values("index").reset_index(drop=True)
-
-            simulated_ym = merged_ym[var_col].values
-            new_nan_rate = np.isnan(simulated_ym).mean()
-            if new_nan_rate < nan_rate:
-                if self._simulation_count <= 1:
-                    print(
-                        f"WARNING: Using year-month merge (daily obs vs monthly output). "
-                        f"NaN rate: {nan_rate*100:.1f}% -> {new_nan_rate*100:.1f}%"
-                    )
-                simulated = simulated_ym
+        if nan_rate > 0.3 and len(output) > 0 and self._simulation_count <= 1:
+            n_valid = int(np.sum(~np.isnan(simulated)))
+            print(
+                f"INFO: {nan_rate*100:.0f}% of obs periods have no matching sim "
+                f"({n_valid}/{len(simulated)} valid pairs). "
+                f"Calibrating on matched {timestep} periods only."
+            )
 
         if np.all(np.isnan(simulated)):
             print(
@@ -1548,7 +1670,11 @@ class SWATModelSetup:
         Return observed data array.
 
         This is called by SPOTPY to get the evaluation (observed) data.
+        For monthly/yearly timesteps, returns the period-averaged observed
+        values computed during simulation() so lengths match.
         """
+        if hasattr(self, "_aggregated_obs") and self._aggregated_obs is not None:
+            return self._aggregated_obs
         return self.observed_df["observed"].values
 
     def objectivefunction(
@@ -1950,9 +2076,9 @@ class MultiSiteSetup(SWATModelSetup):
 
         # Extract values for each site
         simulated_all = []
-        for site, obs_df in zip(self.sites, self._site_observed):
+        for i, (site, obs_df) in enumerate(zip(self.sites, self._site_observed)):
             try:
-                sim = self._extract_site_values(site["reach_id"], obs_df)
+                sim = self._extract_site_values(site["reach_id"], obs_df, site_idx=i)
                 simulated_all.append(sim)
             except Exception as e:
                 print(f"Failed to extract for reach {site['reach_id']}: {e}")
@@ -1965,6 +2091,7 @@ class MultiSiteSetup(SWATModelSetup):
         self,
         reach_id: int,
         obs_df: pd.DataFrame,
+        site_idx: int = 0,
     ) -> np.ndarray:
         """Extract simulated values for a specific site."""
 
@@ -1989,44 +2116,35 @@ class MultiSiteSetup(SWATModelSetup):
         # Normalize to midnight so merge keys match observed dates
         output["date"] = output["date"].dt.normalize()
 
-        # Merge with observed
-        merged = pd.merge(
-            obs_df,
-            output[["date", var_col]],
-            on="date",
-            how="left",
+        # Merge by detected timestep (daily exact match, monthly/yearly
+        # aggregation with averaging of multiple obs per period)
+        timestep = _print_code_to_timestep(self._print_code)
+        merged = _merge_sim_obs(
+            output, obs_df, var_col,
+            obs_col="observed", date_col="date",
+            timestep=timestep, log=False,
         )
 
         simulated = merged[var_col].values
 
-        # Year-month fallback for monthly SWAT output vs daily observed
-        nan_rate = np.isnan(simulated).mean()
-        if nan_rate > 0.5 and len(output) > 0:
-            obs_ym = obs_df["date"].dt.to_period("M")
-            out_ym = output["date"].dt.to_period("M")
-
-            obs_tmp = obs_df.copy()
-            obs_tmp["_ym"] = obs_ym
-            out_tmp = output[["date", var_col]].copy()
-            out_tmp["_ym"] = out_ym
-            out_tmp = out_tmp.drop_duplicates(subset="_ym", keep="first")
-
-            merged_ym = pd.merge(
-                obs_tmp[["_ym"]].reset_index(),
-                out_tmp[["_ym", var_col]],
-                on="_ym",
-                how="left",
-            ).sort_values("index").reset_index(drop=True)
-
-            simulated_ym = merged_ym[var_col].values
-            new_nan_rate = np.isnan(simulated_ym).mean()
-            if new_nan_rate < nan_rate:
-                simulated = simulated_ym
+        # For monthly/yearly, store aggregated obs so evaluation() matches
+        if timestep != "daily":
+            if not hasattr(self, "_site_aggregated_obs"):
+                self._site_aggregated_obs = {}
+            self._site_aggregated_obs[site_idx] = merged["observed"].values
 
         return simulated
 
     def evaluation(self) -> List[np.ndarray]:
         """Return observed data for all sites."""
+        if hasattr(self, "_site_aggregated_obs") and self._site_aggregated_obs:
+            result = []
+            for i, obs in enumerate(self._site_observed):
+                if i in self._site_aggregated_obs:
+                    result.append(self._site_aggregated_obs[i])
+                else:
+                    result.append(obs["observed"].values)
+            return result
         return [obs["observed"].values for obs in self._site_observed]
 
     def objectivefunction(
@@ -2585,17 +2703,32 @@ class MultiConstituentSetup(SWATModelSetup):
             # Get observation dates for this constituent
             obs_for_const = self._observed_loads_df[["date", obs_load_col]].dropna(subset=[obs_load_col])
 
-            if self._comparison_mode == "volume":
-                # Aggregate by month
+            timestep = _print_code_to_timestep(self._print_code)
+
+            if self._comparison_mode == "volume" or timestep == "monthly":
+                # Aggregate by month (explicit volume mode or monthly timestep)
                 obs_monthly = obs_for_const.copy()
                 obs_monthly["_ym"] = obs_monthly["date"].dt.to_period("M")
-                obs_agg = obs_monthly.groupby("_ym")[obs_load_col].sum().reset_index()
+                _agg_func = "sum" if self._comparison_mode == "volume" else "mean"
+                obs_agg = obs_monthly.groupby("_ym")[obs_load_col].agg(_agg_func).reset_index()
 
                 sim_monthly = output[["date", var_col]].copy()
                 sim_monthly["_ym"] = sim_monthly["date"].dt.to_period("M")
-                sim_agg = sim_monthly.groupby("_ym")[var_col].sum().reset_index()
+                sim_agg = sim_monthly.groupby("_ym")[var_col].agg(_agg_func).reset_index()
 
                 merged = pd.merge(obs_agg, sim_agg, on="_ym", how="left")
+                sim_values = merged[var_col].values
+            elif timestep == "yearly":
+                # Aggregate by year
+                obs_yearly = obs_for_const.copy()
+                obs_yearly["_yr"] = obs_yearly["date"].dt.year
+                obs_agg = obs_yearly.groupby("_yr")[obs_load_col].mean().reset_index()
+
+                sim_yearly = output[["date", var_col]].copy()
+                sim_yearly["_yr"] = sim_yearly["date"].dt.year
+                sim_agg = sim_yearly.groupby("_yr")[var_col].mean().reset_index()
+
+                merged = pd.merge(obs_agg, sim_agg, on="_yr", how="left")
                 sim_values = merged[var_col].values
             else:
                 # Time-series mode: merge on exact date
@@ -2637,10 +2770,18 @@ class MultiConstituentSetup(SWATModelSetup):
 
             obs_for_const = self._observed_loads_df[["date", obs_load_col]].dropna(subset=[obs_load_col])
 
-            if self._comparison_mode == "volume":
+            timestep = _print_code_to_timestep(self._print_code)
+
+            if self._comparison_mode == "volume" or timestep == "monthly":
                 obs_monthly = obs_for_const.copy()
                 obs_monthly["_ym"] = obs_monthly["date"].dt.to_period("M")
-                obs_agg = obs_monthly.groupby("_ym")[obs_load_col].sum()
+                _agg_func = "sum" if self._comparison_mode == "volume" else "mean"
+                obs_agg = obs_monthly.groupby("_ym")[obs_load_col].agg(_agg_func)
+                all_obs_values.append(obs_agg.values)
+            elif timestep == "yearly":
+                obs_yearly = obs_for_const.copy()
+                obs_yearly["_yr"] = obs_yearly["date"].dt.year
+                obs_agg = obs_yearly.groupby("_yr")[obs_load_col].mean()
                 all_obs_values.append(obs_agg.values)
             else:
                 all_obs_values.append(obs_for_const[obs_load_col].values)

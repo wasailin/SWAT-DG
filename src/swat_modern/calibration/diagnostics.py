@@ -454,6 +454,9 @@ def flow_duration_curve_metrics(
     sim = np.asarray(simulated, dtype=np.float64)
     n = len(obs)
 
+    if n == 0:
+        return {"FHV": 0.0, "FMS": 0.0, "FLV": 0.0}
+
     # Sort descending for exceedance probabilities
     obs_sorted = np.sort(obs)[::-1]
     sim_sorted = np.sort(sim)[::-1]
@@ -1979,6 +1982,27 @@ def diagnose(
     obs_clean = obs[mask]
     sim_clean = sim[mask]
     dates_clean = np.asarray(dates)[mask] if dates is not None else None
+
+    if len(obs_clean) == 0:
+        import warnings
+        warnings.warn("diagnose(): no overlapping obs/sim data after NaN removal")
+        _empty = np.array([], dtype=np.float64)
+        return DiagnosticReport(
+            obs_baseflow=_empty,
+            sim_baseflow=_empty,
+            bfi_observed=np.nan,
+            bfi_simulated=np.nan,
+            bfi_ratio=np.nan,
+            peak_comparison={},
+            volume_metrics={},
+            overall_metrics={"nse": np.nan, "kge": np.nan, "pbias": np.nan},
+            obs_recession_rate=np.nan,
+            sim_recession_rate=np.nan,
+            fdc_metrics={"FHV": 0.0, "FMS": 0.0, "FLV": 0.0},
+            kge_comp={},
+            findings=[],
+            recommendations=[],
+        )
 
     thresh = {**DIAGNOSTIC_THRESHOLDS, **(thresholds or {})}
 

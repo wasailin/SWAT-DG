@@ -242,7 +242,7 @@ def main():
     st.markdown("---")
     st.markdown("""
     <div style='text-align: center; color: gray;'>
-        SWAT-DG v0.5.0 | All data processed locally |
+        SWAT-DG v0.6.0 | All data processed locally |
         <a href='https://github.com/wasailin/SWAT-DG'>GitHub</a> |
         <a href='https://www.lynxce-env.com/'>Lynxce</a>
     </div>

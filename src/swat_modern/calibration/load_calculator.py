@@ -288,7 +288,11 @@ class LoadCalculator:
         # Find the flow column
         flow_col = self._find_flow_column(flow)
 
-        # Merge WQ observations with flow on date
+        # Merge WQ observations with flow on date.
+        # First try exact date match; if most dates are unmatched AND
+        # the flow data looks monthly (few unique dates relative to
+        # time span), fall back to year-month matching so that e.g. a
+        # WQ sample on 2005-03-15 pairs with the March 2005 flow.
         merged = pd.merge(
             self.wq_obs_df,
             flow[["date", flow_col]].rename(columns={flow_col: "_flow_cms"}),
@@ -296,9 +300,32 @@ class LoadCalculator:
             how="left",
         )
 
-        # Log merge statistics
         n_total = len(self.wq_obs_df)
         n_matched = merged["_flow_cms"].notna().sum()
+
+        # Detect monthly flow: if >50% of obs dates are unmatched and
+        # flow appears to be monthly resolution, re-merge by year-month.
+        if n_matched < n_total * 0.5 and len(flow) > 0:
+            _flow_dates = flow["date"].sort_values()
+            _median_gap = _flow_dates.diff().dt.days.median() if len(_flow_dates) > 2 else 1
+            if _median_gap >= 25:  # monthly or coarser
+                logger.info(
+                    "Flow data appears monthly (median gap %.0f days). "
+                    "Merging WQ observations by year-month instead of exact date.",
+                    _median_gap,
+                )
+                obs_tmp = self.wq_obs_df.copy()
+                obs_tmp["_ym"] = pd.to_datetime(obs_tmp["date"]).dt.to_period("M")
+                flow_tmp = flow[["date", flow_col]].copy()
+                flow_tmp["_ym"] = flow_tmp["date"].dt.to_period("M")
+                # Average flow within each month (in case of multiple entries)
+                flow_monthly = flow_tmp.groupby("_ym")[flow_col].mean().reset_index()
+                flow_monthly = flow_monthly.rename(columns={flow_col: "_flow_cms"})
+                merged = pd.merge(obs_tmp, flow_monthly, on="_ym", how="left")
+                merged = merged.drop(columns="_ym")
+                n_matched = merged["_flow_cms"].notna().sum()
+
+        # Log merge statistics
         if n_matched < n_total:
             n_missing = n_total - n_matched
             logger.info(
@@ -397,14 +424,29 @@ class LoadCalculator:
             on="date",
             how="left",
         )
-        combined = pd.merge(
-            combined,
-            sim[["date", sim_flow_col]].rename(
-                columns={sim_flow_col: "_sim_flow"}
-            ),
-            on="date",
-            how="left",
-        )
+
+        # Merge simulated flow — use year-month matching if sim flow
+        # appears to be monthly resolution (avoids NaN when WQ sample
+        # date doesn't land on the first of the month).
+        _sim_dates = sim["date"].sort_values()
+        _sim_gap = _sim_dates.diff().dt.days.median() if len(_sim_dates) > 2 else 1
+        if _sim_gap >= 25:
+            combined["_ym"] = pd.to_datetime(combined["date"]).dt.to_period("M")
+            sim_tmp = sim[["date", sim_flow_col]].copy()
+            sim_tmp["_ym"] = sim_tmp["date"].dt.to_period("M")
+            sim_monthly = sim_tmp.groupby("_ym")[sim_flow_col].mean().reset_index()
+            sim_monthly = sim_monthly.rename(columns={sim_flow_col: "_sim_flow"})
+            combined = pd.merge(combined, sim_monthly, on="_ym", how="left")
+            combined = combined.drop(columns="_ym")
+        else:
+            combined = pd.merge(
+                combined,
+                sim[["date", sim_flow_col]].rename(
+                    columns={sim_flow_col: "_sim_flow"}
+                ),
+                on="date",
+                how="left",
+            )
 
         # Use observed where available, simulated as fallback
         combined["_flow_cms"] = combined["_obs_flow"].fillna(

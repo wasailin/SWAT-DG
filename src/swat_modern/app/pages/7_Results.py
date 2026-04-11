@@ -1716,7 +1716,7 @@ if is_sequential and results_full is not None:
                     _ft = _pdef.file_type.upper() if _pdef else "?"
                     _scope = f"Per-Subbasin ({_ft})"
                 _param_rows.append({"Parameter": k, "Optimal Value": f"{v:.6f}", "Scope": _scope})
-            st.dataframe(pd.DataFrame(_param_rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(_param_rows), hide_index=True, width="stretch")
             st.caption(
                 "**Per-Subbasin**: applied only to the listed subbasins (.hru/.sub/.rte etc.). "
                 "**Global (BSN)**: applied basin-wide — downstream step's value takes effect."

@@ -44,7 +44,7 @@ Launch Streamlit app:
     run_app()
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from swat_modern.core.model import SWATModel
 from swat_modern.core.config import SWATConfig

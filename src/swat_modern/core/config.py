@@ -39,7 +39,7 @@ class OutputSettings:
     daily: bool = True
     monthly: bool = True
     yearly: bool = True
-    print_code: int = 1  # 1=daily, 2=monthly, 3=yearly
+    print_code: int = 1  # SWAT IPRINT: 0=monthly, 1=daily, 2=yearly
 
 
 class SWATConfig:

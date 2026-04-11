@@ -641,7 +641,11 @@ class Calibrator:
             if algorithm in ["sceua", "rope"]:
                 sampler.sample(n_iterations, ngs=len(self.parameters) + 1)
             elif algorithm == "dream":
-                sampler.sample(n_iterations, nChains=4)
+                # DREAM requires nChains >= 2*delta+1 (default delta=3 -> min 7).
+                # Passing fewer chains makes spotpy's sample() return None before
+                # initializing self.datawriter, causing getdata() to crash with
+                # AttributeError. Use 7 chains as the safe minimum.
+                sampler.sample(n_iterations, nChains=7)
             else:
                 sampler.sample(n_iterations)
 
@@ -864,8 +868,13 @@ class Calibrator:
             cancel_state=getattr(self._setup, "_cancel_state", None),
             constituent=constituent,
             partial_basin_reach=_pbr,
+            print_code=self._print_code,
             _use_working_copy=False,  # SWATModelSetup already created a copy
         )
+        # Propagate cross-process cancel flag for file-based cancel check.
+        _cf_attached = getattr(self._setup, "_cancel_file", None)
+        if _cf_attached is not None:
+            calibrator._cancel_file = _cf_attached
 
         diag_result = calibrator.calibrate()
 
@@ -975,7 +984,12 @@ class Calibrator:
             cancel_state=getattr(self._setup, "_cancel_state", None),
             constituent=constituent,
             partial_basin_reach=_pbr2,
+            print_code=self._print_code,
         )
+        # EnsembleDiagnosticCalibrator creates its own cancel file
+        # internally and registers it on ``cancel_state``. The shared
+        # cancel_file (if any) is still written by ``state.request_cancel``
+        # because it was registered at runner startup.
 
         diag_result = calibrator.calibrate()
 
@@ -998,6 +1012,7 @@ class Calibrator:
         phases: List = None,
         progress_callback: Optional[Callable] = None,
         cancel_state=None,
+        cancel_file: Optional[str] = None,
         verbose: bool = True,
         **kwargs,
     ):
@@ -1061,6 +1076,10 @@ class Calibrator:
         if self._print_code is not None:
             phased_kwargs.setdefault("print_code", self._print_code)
 
+        # Fall back to setup-attached cancel_file if not provided.
+        if cancel_file is None:
+            cancel_file = getattr(self._setup, "_cancel_file", None)
+
         calibrator = PhasedCalibrator(
             model=self.model,
             flow_observations=flow_obs,
@@ -1069,6 +1088,7 @@ class Calibrator:
             phases=phases,
             progress_callback=progress_callback,
             cancel_state=cancel_state,
+            cancel_file=cancel_file,
             **phased_kwargs,
         )
 
@@ -1396,6 +1416,9 @@ class Calibrator:
         use_partial_basin: bool = True,
         verbose: bool = True,
         progress_callback=None,
+        progress_counter_dir: Optional[str] = None,
+        cancel_state=None,
+        cancel_file: Optional[str] = None,
     ) -> Union["CalibrationResult", "SequentialCalibrationResult"]:
         """
         Multi-site calibration with two modes.
@@ -1445,6 +1468,9 @@ class Calibrator:
                 parallel=parallel,
                 verbose=verbose,
                 progress_callback=progress_callback,
+                progress_counter_dir=progress_counter_dir,
+                cancel_state=cancel_state,
+                cancel_file=cancel_file,
             )
         elif mode == "sequential":
             return self._run_sequential(
@@ -1455,6 +1481,8 @@ class Calibrator:
                 use_partial_basin=use_partial_basin,
                 verbose=verbose,
                 progress_callback=progress_callback,
+                cancel_state=cancel_state,
+                cancel_file=cancel_file,
             )
         elif mode == "diagnostic_sequential":
             return self._run_diagnostic_sequential(
@@ -1462,6 +1490,8 @@ class Calibrator:
                 n_iterations=n_iterations,
                 verbose=verbose,
                 progress_callback=progress_callback,
+                cancel_state=cancel_state,
+                cancel_file=cancel_file,
             )
         else:
             raise ValueError(
@@ -1477,6 +1507,9 @@ class Calibrator:
         parallel: bool = False,
         verbose: bool = True,
         progress_callback: Optional[Callable] = None,
+        progress_counter_dir: Optional[str] = None,
+        cancel_state=None,
+        cancel_file: Optional[str] = None,
     ) -> "CalibrationResult":
         """Run simultaneous multi-site calibration using MultiSiteSetup."""
         # Diagnostic algorithms use sequential upstream-to-downstream logic
@@ -1487,6 +1520,8 @@ class Calibrator:
                 n_iterations=n_iterations,
                 verbose=verbose,
                 progress_callback=progress_callback,
+                cancel_state=cancel_state,
+                cancel_file=cancel_file,
             )
 
         try:
@@ -1508,6 +1543,21 @@ class Calibrator:
         if self._print_code is not None:
             ms_kwargs["print_code"] = self._print_code
         setup = MultiSiteSetup(**ms_kwargs)
+
+        # Wire file-based progress tracking so parallel SPOTPY workers
+        # (which lose the in-memory progress_callback during pickling)
+        # can still report per-simulation progress to the caller.
+        if progress_counter_dir is not None:
+            setup._progress_counter_dir = progress_counter_dir
+
+        # Wire cross-process cancellation so ``simulation()`` can short-
+        # circuit and parallel SPOTPY workers detect cancel via the file
+        # flag (threading.Event does not cross process boundaries).
+        if cancel_state is not None:
+            setup._cancel_state = cancel_state
+            setup._cancel_event = getattr(cancel_state, "cancel_event", None)
+        if cancel_file is not None:
+            setup._cancel_file = cancel_file
 
         if verbose:
             print(f"\n{'=' * 60}")
@@ -1545,7 +1595,8 @@ class Calibrator:
             if algorithm.lower() in ["sceua", "rope"]:
                 sampler.sample(n_iterations, ngs=len(self.parameters) + 1)
             elif algorithm.lower() == "dream":
-                sampler.sample(n_iterations, nChains=4)
+                # DREAM requires nChains >= 2*delta+1 (min 7 with default delta=3)
+                sampler.sample(n_iterations, nChains=7)
             else:
                 sampler.sample(n_iterations)
 
@@ -1653,6 +1704,8 @@ class Calibrator:
         use_partial_basin: bool = True,
         verbose: bool = True,
         progress_callback=None,
+        cancel_state=None,
+        cancel_file: Optional[str] = None,
     ):
         """Run sequential upstream-to-downstream calibration."""
         from swat_modern.calibration.sequential import SequentialCalibrator
@@ -1673,6 +1726,12 @@ class Calibrator:
         # Build parameter list from current calibrator's parameters
         params = self.parameters if hasattr(self, 'parameters') else None
 
+        # Fall back to setup-attached values if not explicitly provided.
+        if cancel_state is None:
+            cancel_state = getattr(self._setup, "_cancel_state", None)
+        if cancel_file is None:
+            cancel_file = getattr(self._setup, "_cancel_file", None)
+
         seq_kwargs = dict(
             parameters=params,
             n_iterations=n_iterations,
@@ -1683,7 +1742,8 @@ class Calibrator:
             parallel=parallel,
             verbose=verbose,
             progress_callback=progress_callback,
-            cancel_state=getattr(self._setup, "_cancel_state", None),
+            cancel_state=cancel_state,
+            cancel_file=cancel_file,
         )
         if self._print_code is not None:
             seq_kwargs["print_code"] = self._print_code
@@ -1695,6 +1755,8 @@ class Calibrator:
         n_iterations: int = 15,
         verbose: bool = True,
         progress_callback=None,
+        cancel_state=None,
+        cancel_file: Optional[str] = None,
     ):
         """Run sequential upstream-to-downstream diagnostic calibration."""
         from swat_modern.calibration.sequential import (
@@ -1720,15 +1782,25 @@ class Calibrator:
 
         params = self.parameters if hasattr(self, "parameters") else None
 
-        return seq.run(
+        # Fall back to setup-attached values if not explicitly provided.
+        if cancel_state is None:
+            cancel_state = getattr(self._setup, "_cancel_state", None)
+        if cancel_file is None:
+            cancel_file = getattr(self._setup, "_cancel_file", None)
+
+        seq_run_kwargs = dict(
             parameter_names=params,
             max_iterations_per_step=n_iterations,
             warmup_years=self.warmup_years,
             output_variable=self.output_variable,
             verbose=verbose,
             progress_callback=progress_callback,
-            cancel_state=getattr(self._setup, "_cancel_state", None),
+            cancel_state=cancel_state,
+            cancel_file=cancel_file,
         )
+        if self._print_code is not None:
+            seq_run_kwargs["print_code"] = self._print_code
+        return seq.run(**seq_run_kwargs)
 
     @staticmethod
     def available_algorithms() -> None:
