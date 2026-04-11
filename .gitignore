@@ -13,6 +13,9 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+# sdist-unpack directory left behind by `python -m build` in some envs
+swat_dg-*/
+swat_modern-*/
 downloads/
 eggs/
 .eggs/
