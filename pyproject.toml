@@ -81,9 +81,15 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/wasailin/SWAT-DG"
 Documentation = "https://swat-dg.readthedocs.io"
+Repository = "https://github.com/wasailin/SWAT-DG"
+Issues = "https://github.com/wasailin/SWAT-DG/issues"
+Changelog = "https://github.com/wasailin/SWAT-DG/releases"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"swat_modern" = ["app/_win32_dialog.ps1"]
 
 [tool.black]
 line-length = 88
